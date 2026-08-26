@@ -1,0 +1,64 @@
+diff --git a/src/session_impl.cpp b/src/session_impl.cpp
+index 1704d7d..6c54e67 100644
+--- a/src/session_impl.cpp
++++ b/src/session_impl.cpp
+@@ -1422,9 +1422,6 @@ namespace {
+ 			|| (pack.has_val(settings_pack::proxy_type)
+ 				&& pack.get_int(settings_pack::proxy_type)
+ 					!= m_settings.get_int(settings_pack::proxy_type))
+-			|| (pack.has_val(settings_pack::proxy_peer_connections)
+-				&& pack.get_bool(settings_pack::proxy_peer_connections)
+-					!= m_settings.get_bool(settings_pack::proxy_peer_connections))
+ 			;
+ 
+ #ifndef TORRENT_DISABLE_LOGGING
+@@ -1899,24 +1896,8 @@ namespace {
+ 		// of a new socket failing to bind due to a conflict with a stale socket
+ 		std::vector<listen_endpoint_t> eps;
+ 
+-		// if we don't proxy peer connections, don't apply the special logic for
+-		// proxies
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-		{
+-			// we will be able to accept incoming connections over UDP. so use
+-			// one of the ports the user specified to use a consistent port
+-			// across sessions. If the user did not specify any ports, pick one
+-			// at random
+-			int const port = m_listen_interfaces.empty()
+-				? int(random(63000) + 2000)
+-				: m_listen_interfaces.front().port;
+-			listen_endpoint_t ep(address_v4::any(), port, {}
+-				, transport::plaintext, listen_socket_t::proxy);
+-			eps.emplace_back(ep);
+-		}
+-		else
+ 		{
++
+ 			std::vector<ip_interface> const ifs = enum_net_interfaces(m_io_service, ec);
+ 			if (ec && m_alerts.should_post<listen_failed_alert>())
+ 			{
+@@ -2676,12 +2657,6 @@ namespace {
+ 		}
+ 		async_accept(listener, ssl);
+ 
+-		// don't accept any connections from our local sockets if we're using a
+-		// proxy
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-			return;
+-
+ 		auto listen = std::find_if(m_listen_sockets.begin(), m_listen_sockets.end()
+ 			, [&listener](std::shared_ptr<listen_socket_t> const& l)
+ 		{ return l->sock == listener; });
+@@ -5536,10 +5511,6 @@ namespace {
+ 			return std::uint16_t(sock->tcp_external_port());
+ 		}
+ 
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-			return 0;
+-
+ 		for (auto const& s : m_listen_sockets)
+ 		{
+ 			if (!(s->flags & listen_socket_t::accept_incoming)) continue;
