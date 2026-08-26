@@ -1,6 +1,6 @@
 name: CI - Windows
 
-on: [pull_request, push]
+on: [pull_request, push, workflow_dispatch]
 
 permissions: {}
 
@@ -19,21 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         libtorrent:
-          - version: "2.1.1"
-            boost_major_version: "1"
-            boost_minor_version: "91"
-            boost_patch_version: "0"
-            libt_build_flags: ""
-          - version: "2.0.14"
-            boost_major_version: "1"
-            boost_minor_version: "91"
-            boost_patch_version: "0"
-            libt_build_flags: ""
           - version: "1.2.20"
             boost_major_version: "1"
             boost_minor_version: "86"
             boost_patch_version: "0"
-            libt_build_flags: ""
         config:
         - os: windows-latest
           arch: x64
@@ -46,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -59,14 +48,14 @@ jobs:
         run: |
           if ((Get-Command "ninja.exe" -ErrorAction SilentlyContinue) -eq $null)
           {
-            choco install ninja
+             choco install ninja
           }
           where.exe ninja
           ninja --version
 
       # https://learn.microsoft.com/en-us/vcpkg/users/binarycaching#gha
       - name: Set variables for vcpkg
-        uses: actions/github-script@v9
+        uses: actions/github-script@v8
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', (process.env.ACTIONS_CACHE_URL || ''));
@@ -123,7 +112,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: "6.10.3"
+          version: "6.10.1"
           arch: ${{ matrix.config.qt_arch }}
           archives: qtbase qtsvg qttools
           modules: qtimageformats
@@ -138,7 +127,12 @@ jobs:
             https://github.com/arvidn/libtorrent.git `
             ${{ env.libtorrent_path }}
           cd ${{ env.libtorrent_path }}
-          $env:CFLAGS+=" /guard:cf"
+
+          Get-ChildItem -Path "${{ github.workspace }}/lt-patch/*" -Include "*.patch","*.diff" -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "Applying patch: $($_.Name)"
+              git apply --ignore-whitespace $_.FullName
+          }
+
           $env:CXXFLAGS+=" /guard:cf"
           $env:LDFLAGS+=" /GUARD:CF"
           cmake `
@@ -153,8 +147,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF `
             -Ddeprecated-functions=OFF `
             -Dstatic_runtime=OFF `
-            -DVCPKG_TARGET_TRIPLET=${{ matrix.config.arch }}-windows-static-md-release `
-            ${{ matrix.libtorrent.libt_build_flags }}
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.config.arch }}-windows-static-md-release
           cmake --build build
           cmake --install build
 
@@ -182,7 +175,6 @@ jobs:
         run: |
           mkdir upload
           mkdir upload/qBittorrent
-          # binaries
           copy build/qbittorrent.exe upload/qBittorrent
           copy build/qbittorrent.pdb upload/qBittorrent
           copy dist/windows/qt.conf upload/qBittorrent
@@ -223,7 +215,7 @@ jobs:
           copy ${{ env.libtorrent_path }}/build/compile_commands.json upload/cmake/libtorrent
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
           name: qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}
           path: upload
@@ -236,15 +228,10 @@ jobs:
       - name: Create installer
         run: |
           7z x -o"dist/windows/" "dist/windows/NSISPlugins.zip"
-          makensis `
-            /DQBT_CPU_ARCH="${{ matrix.config.arch }}" `
-            /DQBT_DIST_DIR="../../upload/qBittorrent" `
-            /WX `
-            dist/windows/qbittorrent.nsi
-          move "dist/windows/qbittorrent_*_setup.exe" "qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}-setup.exe"
+          makensis /DQBT_CPU_ARCH="${{ matrix.config.arch }}" /DQBT_DIST_DIR="../../upload/qBittorrent" /WX dist/windows/qbittorrent.nsi
 
       - name: Upload installer
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
-          archive: false
-          path: qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}-setup.exe
+          name: qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}-setup
+          path: dist/windows/qbittorrent_*_setup.exe
