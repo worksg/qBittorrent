@@ -1,0 +1,1240 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff9d60a..e017af7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -106,6 +106,7 @@ set(libtorrent_include_files
+ 	peer_connection.hpp
+ 	peer_connection_handle.hpp
+ 	peer_connection_interface.hpp
++	peer_filter.hpp
+ 	peer_id.hpp
+ 	peer_info.hpp
+ 	peer_list.hpp
+@@ -341,6 +342,7 @@ set(sources
+ 	peer_class_set.cpp
+ 	peer_connection.cpp
+ 	peer_connection_handle.cpp
++	peer_filter.cpp
+ 	peer_info.cpp
+ 	peer_list.cpp
+ 	performance_counters.cpp
+diff --git a/Jamfile b/Jamfile
+index 5ec7447..1b30955 100644
+--- a/Jamfile
++++ b/Jamfile
+@@ -650,6 +650,7 @@ SOURCES =
+ 	web_peer_connection
+ 	http_seed_connection
+ 	peer_connection_handle
++	peer_filter
+ 	i2p_stream
+ 	instantiate_connection
+ 	lazy_bdecode
+diff --git a/include/libtorrent/Makefile.am b/include/libtorrent/Makefile.am
+index eb8841c..e47cc41 100644
+--- a/include/libtorrent/Makefile.am
++++ b/include/libtorrent/Makefile.am
+@@ -86,6 +86,7 @@ nobase_include_HEADERS = \
+   peer_connection.hpp          \
+   peer_connection_handle.hpp   \
+   peer_connection_interface.hpp \
++  peer_filter.hpp               \
+   peer.hpp                     \
+   peer_class.hpp               \
+   peer_class_set.hpp           \
+diff --git a/include/libtorrent/alert_types.hpp b/include/libtorrent/alert_types.hpp
+index 18c1dae..ed17efc 100644
+--- a/include/libtorrent/alert_types.hpp
++++ b/include/libtorrent/alert_types.hpp
+@@ -1731,6 +1731,7 @@ TORRENT_VERSION_NAMESPACE_2
+ 	// * the port filter
+ 	// * the peer has a low port and ``no_connect_privileged_ports`` is enabled
+ 	// * the protocol of the peer is blocked (uTP/TCP blocking)
++	// * the peer filter (peer-id, client name or IP)
+ 	struct TORRENT_EXPORT peer_blocked_alert final : peer_alert
+ 	{
+ 		// internal
+@@ -1751,7 +1752,8 @@ TORRENT_VERSION_NAMESPACE_2
+ 			utp_disabled,
+ 			tcp_disabled,
+ 			invalid_local_interface,
+-			ssrf_mitigation
++			ssrf_mitigation,
++			peer_filter
+ 		};
+ 
+ 		// the reason for the peer being blocked. Is one of the values from the
+diff --git a/include/libtorrent/aux_/session_impl.hpp b/include/libtorrent/aux_/session_impl.hpp
+index 9feaead..c06eef9 100644
+--- a/include/libtorrent/aux_/session_impl.hpp
++++ b/include/libtorrent/aux_/session_impl.hpp
+@@ -56,6 +56,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/debug.hpp"
+ #include "libtorrent/piece_block_progress.hpp"
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/aux_/ip_notifier.hpp"
+ #include "libtorrent/session_status.hpp"
+ #include "libtorrent/add_torrent_params.hpp"
+@@ -537,6 +538,9 @@ namespace aux {
+ 			void set_ip_filter(std::shared_ptr<ip_filter> const& f);
+ 			ip_filter const& get_ip_filter();
+ 
++			void set_peer_filter(std::shared_ptr<peer_filter> const& f);
++			peer_filter const& get_peer_filter();
++
+ 			void set_port_filter(port_filter const& f);
+ 			port_filter const& get_port_filter() const override;
+ 			void ban_ip(address addr) override;
+@@ -995,6 +999,10 @@ namespace aux {
+ 			// filters incoming connections
+ 			std::shared_ptr<ip_filter> m_ip_filter;
+ 
++			// filters incoming and outgoing peer connections based on
++			// peer-id, client name or IP address
++			std::shared_ptr<peer_filter> m_peer_filter;
++
+ 			// filters outgoing connections
+ 			port_filter m_port_filter;
+ 
+diff --git a/include/libtorrent/bt_peer_connection.hpp b/include/libtorrent/bt_peer_connection.hpp
+index 66a8b11..b842c3a 100644
+--- a/include/libtorrent/bt_peer_connection.hpp
++++ b/include/libtorrent/bt_peer_connection.hpp
+@@ -108,6 +108,9 @@ namespace libtorrent {
+ 
+ 		peer_id our_pid() const override { return m_our_peer_id; }
+ 
++		std::string const& client_version() const override
++		{ return m_client_version; }
++
+ #if !defined TORRENT_DISABLE_ENCRYPTION
+ 		bool supports_encryption() const
+ 		{ return m_encrypted; }
+diff --git a/include/libtorrent/error_code.hpp b/include/libtorrent/error_code.hpp
+index 17a752a..ef97071 100644
+--- a/include/libtorrent/error_code.hpp
++++ b/include/libtorrent/error_code.hpp
+@@ -329,6 +329,9 @@ namespace libtorrent {
+ 			ssrf_mitigation,
+ 			// blocked because IDNA host names are banned
+ 			blocked_by_idna,
++			// The peer was blocked by the peer filter
++			// (peer-id, client name or IP blacklist)
++			banned_by_client_filter,
+ 
+ #if TORRENT_ABI_VERSION == 1
+ 			// these error codes are deprecated, NAT-PMP/PCP error codes have
+diff --git a/include/libtorrent/fwd.hpp b/include/libtorrent/fwd.hpp
+index d518063..179ece6 100644
+--- a/include/libtorrent/fwd.hpp
++++ b/include/libtorrent/fwd.hpp
+@@ -192,6 +192,9 @@ class hasher512;
+ struct ip_filter;
+ class port_filter;
+ 
++// include/libtorrent/peer_filter.hpp
++class peer_filter;
++
+ // include/libtorrent/kademlia/dht_settings.hpp
+ namespace dht {
+ struct dht_settings;
+diff --git a/include/libtorrent/peer_connection_interface.hpp b/include/libtorrent/peer_connection_interface.hpp
+index cada62f..5c115d7 100644
+--- a/include/libtorrent/peer_connection_interface.hpp
++++ b/include/libtorrent/peer_connection_interface.hpp
+@@ -60,6 +60,13 @@ namespace libtorrent {
+ 			, operation_t op, disconnect_severity_t = peer_connection_interface::normal) = 0;
+ 		virtual peer_id const& pid() const = 0;
+ 		virtual peer_id our_pid() const = 0;
++		// returns the client version advertised by the peer in the BEP 10
++		// extended handshake ("v" field). This may be more truthful than
++		// the client derived from the peer-id, which some clients spoof.
++		// Empty if not known (i.e. before the extended handshake has been
++		// received, or not applicable to this connection type).
++		virtual std::string const& client_version() const
++		{ static std::string const empty; return empty; }
+ 		virtual void set_holepunch_mode() = 0;
+ 		virtual torrent_peer* peer_info_struct() const = 0;
+ 		virtual void set_peer_info(torrent_peer* pi) = 0;
+diff --git a/include/libtorrent/peer_filter.hpp b/include/libtorrent/peer_filter.hpp
+new file mode 100644
+index 0000000..c06ff44
+--- /dev/null
++++ b/include/libtorrent/peer_filter.hpp
+@@ -0,0 +1,160 @@
++/*
++
++Copyright (c) 2005-2018, Arvid Norberg
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions
++are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the distribution.
++    * Neither the name of the author nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++*/
++
++#ifndef TORRENT_PEER_FILTER_HPP_INCLUDED
++#define TORRENT_PEER_FILTER_HPP_INCLUDED
++
++#include <string>
++#include <vector>
++#include <regex>
++
++#include "libtorrent/config.hpp"
++#include "libtorrent/address.hpp"
++#include "libtorrent/error_code.hpp"
++#include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_id.hpp"
++
++namespace libtorrent {
++
++// The ``peer_filter`` class is a set of rules used to reject incoming and
++// outgoing peer connections based on any of:
++//
++// * the peer-id (matched by prefix or regular expression)
++// * the client name (matched by case-insensitive sub-string or regular
++//   expression). Both the name derived from the peer-id (see
++//   identify_client) and the client version advertised in the BEP 10
++//   extended handshake ("v" field) are evaluated. The latter may be more
++//   truthful, since some clients spoof their peer-id; connections are
++//   re-checked when the extended handshake arrives.
++// * the remote IP address
++//
++// A default constructed peer_filter does not filter any peer.
++//
++// Note that IP rules are only enforced once the bittorrent handshake has been
++// received (or re-applied to already connected peers when the filter is
++// updated). The ``ip_filter`` is enforced earlier (when dialing or accepting
++// connections), so for pure IP blocking prefer ``ip_filter``.
++//
++// IPv4-mapped IPv6 addresses (e.g. ``::ffff:10.0.0.5``) are treated as plain
++// IPv4 addresses when matching IP rules.
++//
++// Connections matching peer-id or client name rules are always disconnected
++// and removed from the peer list, including connections from internal
++// addresses. Since the disconnect and peer-list removal only affect the
++// single connection (ip:port), other connections from the same internal IP
++// (e.g. reverse-proxy setups) are unaffected. Explicit IP rules are applied
++// as-is.
++class TORRENT_EXPORT peer_filter
++{
++public:
++
++	// Adds a rule to block all peers whose peer-id starts with ``prefix``.
++	// The prefix is truncated to 20 bytes (the size of a peer-id). An empty
++	// prefix is ignored.
++	void add_peer_id(std::string const& prefix);
++
++	// Adds a rule to block all peers whose client name contains ``client``
++	// (case-insensitive). An empty string is ignored.
++	void add_client(std::string const& client);
++
++	// Adds a rule to block all peers whose peer-id matches the ECMAScript
++	// regular expression ``pattern`` (partial match, ``std::regex_search``).
++	// On invalid pattern, ``ec`` is set to errors::parse_failed and no rule
++	// is added. An empty pattern is ignored.
++	void add_peer_id_regex(std::string const& pattern, error_code& ec);
++
++	// Adds a rule to block all peers whose client name matches the
++	// ECMAScript regular expression ``pattern`` (partial match,
++	// ``std::regex_search``). On invalid pattern, ``ec`` is set to
++	// errors::parse_failed and no rule is added. An empty pattern is ignored.
++	void add_client_regex(std::string const& pattern, error_code& ec);
++
++	// Adds an IP rule. Equivalent to ip_filter::add_rule(). Only ranges
++	// flagged with ``ip_filter::blocked`` are honored by this filter.
++	void add_rule(address const& first, address const& last, std::uint32_t flags);
++
++	// Removes all rules from the filter.
++	void clear();
++
++	// Returns true if the filter does not block anything.
++	bool empty() const;
++
++	// Returns true if the peer described by the given ``pid``, ``client``
++	// name and remote ``addr`` is blocked by any rule in this filter.
++	bool peer_blocked(peer_id const& pid, std::string const& client
++		, address const& addr) const;
++
++private:
++
++	ip_filter m_ip_filter;
++	std::vector<std::string> m_peer_ids;
++	std::vector<std::string> m_clients;
++	std::vector<std::regex> m_peer_id_regexes;
++	std::vector<std::regex> m_client_regexes;
++	bool m_has_ip_rules = false;
++};
++
++// Returns true for internal addresses: RFC 1918 private ranges
++// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback, IPv4 link-local
++// (169.254.0.0/16) and IPv6 loopback, link-local (fe80::/10) and
++// unique-local (fc00::/7) addresses. IPv4-mapped IPv6 addresses are
++// evaluated as their embedded IPv4 address.
++TORRENT_EXPORT bool is_internal_address(address const& addr);
++
++// Loads a peer_filter from the file at ``path``. Each non-empty line in the
++// file that does not start with '#' is a rule. A rule consists of a keyword
++// and an argument, separated by whitespace:
++//
++// 	ip <addr>[/prefix] | <addr>-<addr>
++// 		block a single IP address, an IP range or a subnet (IPv4 and IPv6)
++// 	peer <peer-id-prefix>
++// 		block peers whose peer-id starts with the given prefix
++// 		(e.g. "-XL0012-")
++// 	client <substring>
++// 		block peers whose client name contains the given sub-string
++// 		(case-insensitive)
++// 	peer-regex <pattern>
++// 		block peers whose peer-id matches the given ECMAScript regular
++// 		expression (e.g. "-XL[0-9]{4}-")
++// 	client-regex <pattern>
++// 		block peers whose client name matches the given ECMAScript regular
++// 		expression (e.g. ".*[Xx]unlei.*")
++//
++// Rules are added to ``out``, which may already contain rules. Returns true
++// on success and false on failure, in which case ``ec`` is set. ``out`` may
++// be left partially updated on failure.
++TORRENT_EXPORT bool load_peer_filter_file(std::string const& path
++	, peer_filter& out, error_code& ec);
++
++}
++
++#endif // TORRENT_PEER_FILTER_HPP_INCLUDED
+diff --git a/include/libtorrent/peer_list.hpp b/include/libtorrent/peer_list.hpp
+index 6ada298..81fbf27 100644
+--- a/include/libtorrent/peer_list.hpp
++++ b/include/libtorrent/peer_list.hpp
+@@ -140,6 +140,8 @@ namespace libtorrent {
+ 			, std::vector<address>& banned);
+ 		void apply_port_filter(port_filter const& filter, torrent_state* state
+ 			, std::vector<address>& banned);
++		void apply_peer_filter(peer_filter const& filter, torrent_state* state
++			, std::vector<address>& banned);
+ 
+ 		void set_seed(torrent_peer* p, bool s);
+ 
+diff --git a/include/libtorrent/session_handle.hpp b/include/libtorrent/session_handle.hpp
+index 0cbd4a2..a2b36ce 100644
+--- a/include/libtorrent/session_handle.hpp
++++ b/include/libtorrent/session_handle.hpp
+@@ -620,6 +620,22 @@ namespace libtorrent {
+ 		// anti-virus software by connecting to SMTP, FTP ports.
+ 		void set_port_filter(port_filter const& f);
+ 
++		// Sets a filter that will be used to reject incoming as well as
++		// outgoing peer connections based on their peer-id, client name or
++		// originating ip address. The default filter does not block anything.
++		// To build a set of rules, see peer_filter. To load rules from a file,
++		// see load_peer_filter_file().
++		//
++		// When the session starts, if a file named ``rules.txt`` exists in
++		// the process' current working directory, it is automatically loaded
++		// as the initial peer filter.
++		//
++		// Each time a peer is blocked because of the peer filter, a
++		// peer_blocked_alert is generated. ``get_peer_filter()`` returns the
++		// peer_filter currently in the session. See peer_filter.
++		void set_peer_filter(peer_filter const& f);
++		peer_filter get_peer_filter() const;
++
+ #if TORRENT_ABI_VERSION == 1
+ 		// deprecated in 1.1, use settings_pack::peer_fingerprint instead
+ 		TORRENT_DEPRECATED
+diff --git a/include/libtorrent/torrent.hpp b/include/libtorrent/torrent.hpp
+index 5ba83b0..bd9483f 100644
+--- a/include/libtorrent/torrent.hpp
++++ b/include/libtorrent/torrent.hpp
+@@ -506,8 +506,11 @@ namespace libtorrent {
+ 		void received_synack(bool ipv6);
+ 
+ 		void set_ip_filter(std::shared_ptr<const ip_filter> ipf);
++		void set_peer_filter(std::shared_ptr<const peer_filter> f);
+ 		void port_filter_updated();
+ 		ip_filter const* get_ip_filter() { return m_ip_filter.get(); }
++		std::shared_ptr<const peer_filter> get_peer_filter() const
++		{ return m_apply_ip_filter ? m_peer_filter : nullptr; }
+ 
+ 		std::string resolve_filename(file_index_t file) const;
+ 		void handle_exception();
+@@ -1206,6 +1209,7 @@ namespace libtorrent {
+ 		void on_remove_peers() noexcept;
+ 
+ 		void ip_filter_updated();
++		void peer_filter_updated();
+ 
+ 		void inc_stats_counter(int c, int value = 1);
+ 
+@@ -1260,6 +1264,10 @@ namespace libtorrent {
+ 
+ 		std::shared_ptr<const ip_filter> m_ip_filter;
+ 
++		// filters incoming and outgoing peer connections based on
++		// peer-id, client name or IP address
++		std::shared_ptr<const peer_filter> m_peer_filter;
++
+ 		// all time totals of uploaded and downloaded payload
+ 		// stored in resume data
+ 		std::int64_t m_total_uploaded = 0;
+diff --git a/src/Makefile.am b/src/Makefile.am
+index ea25a89..d3c16b0 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -101,6 +101,7 @@ libtorrent_rasterbar_la_SOURCES = \
+   performance_counters.cpp        \
+   peer_connection.cpp             \
+   peer_connection_handle.cpp      \
++  peer_filter.cpp                 \
+   peer_class.cpp                  \
+   peer_class_set.cpp              \
+   piece_picker.cpp                \
+diff --git a/src/alert.cpp b/src/alert.cpp
+index 1e24a4d..e33dffa 100644
+--- a/src/alert.cpp
++++ b/src/alert.cpp
+@@ -1402,7 +1402,8 @@ namespace {
+ 			"utp_disabled",
+ 			"tcp_disabled",
+ 			"invalid_local_interface",
+-			"ssrf_mitigation"
++			"ssrf_mitigation",
++			"peer_filter"
+ 		};
+ 
+ 		std::snprintf(ret, sizeof(ret), "%s: blocked peer [%s]"
+diff --git a/src/bt_peer_connection.cpp b/src/bt_peer_connection.cpp
+index 3ce0d8d..6dedd3f 100644
+--- a/src/bt_peer_connection.cpp
++++ b/src/bt_peer_connection.cpp
+@@ -44,6 +44,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/bt_peer_connection.hpp"
+ #include "libtorrent/session.hpp"
+ #include "libtorrent/identify_client.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/entry.hpp"
+ #include "libtorrent/bencode.hpp"
+ #include "libtorrent/alert_types.hpp"
+@@ -1754,6 +1755,22 @@ namespace {
+ 			verify_encoding(m_client_version);
+ 		}
+ 
++		// The client version advertised in the extended handshake may be
++		// more truthful than the peer-id (which some clients spoof).
++		// Re-evaluate the peer filter with the real client version.
++		if (std::shared_ptr<const peer_filter> const pf = t->get_peer_filter())
++		{
++			if (pf->peer_blocked(pid(), m_client_version, remote().address()))
++			{
++				if (t->alerts().should_post<peer_blocked_alert>())
++					t->alerts().emplace_alert<peer_blocked_alert>(t->get_handle()
++						, remote(), peer_blocked_alert::peer_filter);
++				disconnect(errors::banned_by_client_filter
++					, operation_t::bittorrent);
++				return;
++			}
++		}
++
+ 		int const reqq = int(root.dict_find_int_value("reqq"));
+ 		if (reqq > 0) max_out_request_queue(reqq);
+ 
+@@ -3214,6 +3231,22 @@ namespace {
+ 
+ 			set_pid(pid);
+ 			m_client_version = identify_client(pid);
++
++			// if the peer is blocked by the peer filter (peer-id, client
++			// name or IP), close the connection
++			if (std::shared_ptr<const peer_filter> const pf = t->get_peer_filter())
++			{
++				if (pf->peer_blocked(pid, m_client_version, remote().address()))
++				{
++					if (t->alerts().should_post<peer_blocked_alert>())
++						t->alerts().emplace_alert<peer_blocked_alert>(t->get_handle()
++							, remote(), peer_blocked_alert::peer_filter);
++					disconnect(errors::banned_by_client_filter
++						, operation_t::bittorrent);
++					return;
++				}
++			}
++
+ 			if (pid[0] == '-' && pid[1] == 'B' && pid[2] == 'C' && pid[7] == '-')
+ 			{
+ 				// if this is a bitcomet client, lower the request queue size limit
+diff --git a/src/close_reason.cpp b/src/close_reason.cpp
+index c64768d..f6d09fb 100644
+--- a/src/close_reason.cpp
++++ b/src/close_reason.cpp
+@@ -119,6 +119,7 @@ namespace libtorrent {
+ 				TORRENT_MAP(invalid_ssl_cert, close_reason_t::blocked)
+ 				TORRENT_MAP(not_an_ssl_torrent, close_reason_t::blocked)
+ 				TORRENT_MAP(banned_by_port_filter, close_reason_t::port_blocked)
++				TORRENT_MAP(banned_by_client_filter, close_reason_t::blocked)
+ 
+ #ifdef TORRENT_USE_ASSERTS
+ 				case errors::redirecting:
+diff --git a/src/error_code.cpp b/src/error_code.cpp
+index 7c5b76d..7f5b04e 100644
+--- a/src/error_code.cpp
++++ b/src/error_code.cpp
+@@ -174,7 +174,7 @@ namespace libtorrent {
+ 			"listen socket has been closed",
+ 			"blocked by SSRF mitigation",
+ 			"blocked by IDNA ban",
+-			"",
++			"banned by peer filter",
+ 
+ // natpmp errors
+ 			"unsupported protocol version",
+diff --git a/src/peer_filter.cpp b/src/peer_filter.cpp
+new file mode 100644
+index 0000000..71909cd
+--- /dev/null
++++ b/src/peer_filter.cpp
+@@ -0,0 +1,410 @@
++/*
++
++Copyright (c) 2005-2018, Arvid Norberg
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions
++are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the distribution.
++    * Neither the name of the author nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++*/
++
++#include "libtorrent/peer_filter.hpp"
++#include "libtorrent/file.hpp"
++#include "libtorrent/span.hpp"
++
++#include <cctype>
++#include <algorithm>
++#include <cstdint>
++
++namespace libtorrent {
++
++namespace {
++
++	bool icompare(char const a, char const b)
++	{
++		return std::tolower(static_cast<unsigned char>(a))
++			== std::tolower(static_cast<unsigned char>(b));
++	}
++
++	bool contains_ci(std::string const& haystack, std::string const& needle)
++	{
++		if (needle.empty()) return false;
++		if (haystack.size() < needle.size()) return false;
++		for (std::size_t i = 0; i <= haystack.size() - needle.size(); ++i)
++		{
++			std::size_t j = 0;
++			for (; j < needle.size(); ++j)
++			{
++				if (!icompare(haystack[i + j], needle[j])) break;
++			}
++			if (j == needle.size()) return true;
++		}
++		return false;
++	}
++
++	bool is_ws(char const c)
++	{
++		return c == ' ' || c == '\t' || c == '\r';
++	}
++
++	// converts an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to a plain
++	// IPv4 address, so IP rules written for IPv4 match such addresses too
++	address normalize_address(address const& a)
++	{
++		if (!a.is_v6()) return a;
++		address_v6::bytes_type const b = a.to_v6().to_bytes();
++		for (int i = 0; i < 10; ++i)
++			if (b[std::size_t(i)] != 0) return a;
++		if (b[10] != 0xff || b[11] != 0xff) return a;
++		address_v4::bytes_type v4 = {{ b[12], b[13], b[14], b[15] }};
++		return address(address_v4(v4));
++	}
++
++	int parse_prefix(std::string const& s, int const max, error_code& ec)
++	{
++		if (s.empty())
++		{
++			ec = errors::parse_failed;
++			return -1;
++		}
++		int ret = 0;
++		for (char const c : s)
++		{
++			if (c < '0' || c > '9')
++			{
++				ec = errors::parse_failed;
++				return -1;
++			}
++			ret = ret * 10 + (c - '0');
++			if (ret > max)
++			{
++				ec = errors::parse_failed;
++				return -1;
++			}
++		}
++		return ret;
++	}
++
++	bool parse_ip_rule(std::string const& arg, peer_filter& out, error_code& ec)
++	{
++		std::size_t const slash = arg.find('/');
++		if (slash != std::string::npos)
++		{
++			// subnet, e.g. "1.2.3.0/24" or "2001:db8::/32"
++			address const base = address::from_string(arg.substr(0, slash), ec);
++			if (ec) return false;
++
++			int const prefix = parse_prefix(arg.substr(slash + 1)
++				, base.is_v4() ? 32 : 128, ec);
++			if (ec) return false;
++
++			if (base.is_v4())
++			{
++				std::uint32_t const ip = base.to_v4().to_ulong();
++				std::uint32_t const mask = prefix == 0 ? 0U
++					: (0xffffffffU << (32 - prefix)) & 0xffffffffU;
++				std::uint32_t const first = ip & mask;
++				std::uint32_t const last = ip | ~mask;
++				out.add_rule(address_v4(first), address_v4(last)
++					, ip_filter::blocked);
++			}
++			else
++			{
++				address_v6::bytes_type const b = base.to_v6().to_bytes();
++				address_v6::bytes_type first;
++				address_v6::bytes_type last;
++				for (int i = 0; i < 16; ++i)
++				{
++					int const bits = std::max(0, std::min(8, prefix - i * 8));
++					std::uint8_t const mask = bits == 0
++						? 0 : std::uint8_t(0xff << (8 - bits));
++					first[std::size_t(i)] = std::uint8_t(b[std::size_t(i)] & mask);
++					last[std::size_t(i)] = std::uint8_t(b[std::size_t(i)] | ~mask);
++				}
++				out.add_rule(address_v6(first), address_v6(last)
++					, ip_filter::blocked);
++			}
++			return true;
++		}
++
++		std::size_t const dash = arg.find('-');
++		if (dash != std::string::npos)
++		{
++			// range, e.g. "1.2.3.4-1.2.3.10"
++			address const first = normalize_address(
++				address::from_string(arg.substr(0, dash), ec));
++			if (ec) return false;
++			address const last = normalize_address(
++				address::from_string(arg.substr(dash + 1), ec));
++			if (ec) return false;
++			if (first.is_v4() != last.is_v4())
++			{
++				ec = errors::parse_failed;
++				return false;
++			}
++			out.add_rule(first, last, ip_filter::blocked);
++			return true;
++		}
++
++		// single address
++		address const addr = normalize_address(address::from_string(arg, ec));
++		if (ec) return false;
++		out.add_rule(addr, addr, ip_filter::blocked);
++		return true;
++	}
++
++	bool parse_rule(char const* const begin, std::size_t const len
++		, peer_filter& out, error_code& ec)
++	{
++		std::size_t start = 0;
++		while (start < len && is_ws(begin[start])) ++start;
++		std::size_t end = len;
++		while (end > start && is_ws(begin[end - 1])) --end;
++		if (start == end) return true; // empty line
++		if (begin[start] == '#') return true; // comment
++
++		std::size_t kw_end = start;
++		while (kw_end < end && !is_ws(begin[kw_end])) ++kw_end;
++		std::string const keyword(begin + start, kw_end - start);
++
++		std::size_t arg_start = kw_end;
++		while (arg_start < end && is_ws(begin[arg_start])) ++arg_start;
++		std::string const arg(begin + arg_start, end - arg_start);
++
++		if (keyword == "ip")
++			return parse_ip_rule(arg, out, ec);
++		if (keyword == "peer")
++		{
++			out.add_peer_id(arg);
++			return true;
++		}
++		if (keyword == "client")
++		{
++			out.add_client(arg);
++			return true;
++		}
++		if (keyword == "peer-regex")
++		{
++			out.add_peer_id_regex(arg, ec);
++			return !ec;
++		}
++		if (keyword == "client-regex")
++		{
++			out.add_client_regex(arg, ec);
++			return !ec;
++		}
++
++		ec = errors::parse_failed;
++		return false;
++	}
++
++	// the maximum size of a rule file we accept to load into memory
++	std::size_t const max_rule_file_size = 64 * 1024 * 1024;
++
++} // anonymous namespace
++
++	bool is_internal_address(address const& a)
++	{
++		address const norm = normalize_address(a);
++		if (norm.is_v4())
++		{
++			std::uint32_t const ip = norm.to_v4().to_ulong();
++			return (ip & 0xff000000U) == 0x0a000000U // 10.0.0.0/8
++				|| (ip & 0xfff00000U) == 0xac100000U // 172.16.0.0/12
++				|| (ip & 0xffff0000U) == 0xc0a80000U // 192.168.0.0/16
++				|| (ip & 0xff000000U) == 0x7f000000U // 127.0.0.0/8
++				|| (ip & 0xffff0000U) == 0xa9fe0000U // 169.254.0.0/16
++				;
++		}
++		if (norm.is_v6())
++		{
++			if (norm.is_loopback()) return true;
++			address_v6::bytes_type const b = norm.to_v6().to_bytes();
++			if ((b[0] & 0xfe) == 0xfe) return true; // fe80::/10
++			if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7
++		}
++		return false;
++	}
++
++	void peer_filter::add_peer_id(std::string const& prefix)
++	{
++		if (prefix.empty()) return;
++		if (prefix.size() > 20)
++			m_peer_ids.push_back(prefix.substr(0, 20));
++		else
++			m_peer_ids.push_back(prefix);
++	}
++
++	void peer_filter::add_client(std::string const& client)
++	{
++		if (client.empty()) return;
++		m_clients.push_back(client);
++	}
++
++	void peer_filter::add_peer_id_regex(std::string const& pattern, error_code& ec)
++	{
++		ec.clear();
++		if (pattern.empty()) return;
++#ifndef BOOST_NO_EXCEPTIONS
++		try
++		{
++			m_peer_id_regexes.emplace_back(pattern);
++		}
++		catch (std::regex_error const&)
++		{
++			ec = errors::parse_failed;
++		}
++#else
++		m_peer_id_regexes.emplace_back(pattern);
++#endif
++	}
++
++	void peer_filter::add_client_regex(std::string const& pattern, error_code& ec)
++	{
++		ec.clear();
++		if (pattern.empty()) return;
++#ifndef BOOST_NO_EXCEPTIONS
++		try
++		{
++			m_client_regexes.emplace_back(pattern);
++		}
++		catch (std::regex_error const&)
++		{
++			ec = errors::parse_failed;
++		}
++#else
++		m_client_regexes.emplace_back(pattern);
++#endif
++	}
++
++	void peer_filter::add_rule(address const& first, address const& last
++		, std::uint32_t const flags)
++	{
++		m_ip_filter.add_rule(first, last, flags);
++		if (flags & ip_filter::blocked) m_has_ip_rules = true;
++	}
++
++	void peer_filter::clear()
++	{
++		m_ip_filter = ip_filter();
++		m_peer_ids.clear();
++		m_clients.clear();
++		m_peer_id_regexes.clear();
++		m_client_regexes.clear();
++		m_has_ip_rules = false;
++	}
++
++	bool peer_filter::empty() const
++	{
++		return !m_has_ip_rules && m_peer_ids.empty() && m_clients.empty()
++			&& m_peer_id_regexes.empty() && m_client_regexes.empty();
++	}
++
++	bool peer_filter::peer_blocked(peer_id const& pid, std::string const& client
++		, address const& addr) const
++	{
++		// normalize IPv4-mapped IPv6 addresses to plain IPv4 so that IP
++		// rules written for IPv4 match such addresses too
++		address const norm_addr = normalize_address(addr);
++
++		if (m_has_ip_rules && (m_ip_filter.access(norm_addr) & ip_filter::blocked))
++			return true;
++
++		for (auto const& prefix : m_peer_ids)
++		{
++			if (std::equal(prefix.begin(), prefix.end(), pid.data()))
++				return true;
++		}
++
++		if (!m_peer_id_regexes.empty())
++		{
++			std::string const pid_str(pid.data(), static_cast<std::size_t>(pid.size()));
++			for (auto const& re : m_peer_id_regexes)
++			{
++				if (std::regex_search(pid_str, re))
++					return true;
++			}
++		}
++
++		if (!client.empty())
++		{
++			for (auto const& c : m_clients)
++			{
++				if (contains_ci(client, c))
++					return true;
++			}
++			for (auto const& re : m_client_regexes)
++			{
++				if (std::regex_search(client, re))
++					return true;
++			}
++		}
++
++		return false;
++	}
++
++	bool load_peer_filter_file(std::string const& path, peer_filter& out
++		, error_code& ec)
++	{
++		ec.clear();
++		file f;
++		if (!f.open(path, open_mode::read_only, ec)) return false;
++
++		std::int64_t const size = f.get_size(ec);
++		if (ec || size < 0) return false;
++		if (size > std::int64_t(max_rule_file_size))
++		{
++			ec.assign(boost::system::errc::file_too_large
++				, boost::system::generic_category());
++			return false;
++		}
++
++		std::vector<char> buf(static_cast<std::size_t>(size));
++		if (size == 0) return true;
++
++		span<char> const view(buf);
++		std::int64_t const read = f.readv(0, view, ec);
++		if (ec) return false;
++		if (read != size)
++		{
++			ec.assign(boost::system::errc::io_error
++				, boost::system::generic_category());
++			return false;
++		}
++
++		std::size_t pos = 0;
++		std::size_t const len = buf.size();
++		while (pos < len)
++		{
++			std::size_t eol = pos;
++			while (eol < len && buf[eol] != '\n') ++eol;
++			if (eol > pos && !parse_rule(buf.data() + pos, eol - pos, out, ec))
++				return false;
++			pos = eol + 1;
++		}
++		return true;
++	}
++
++}
+diff --git a/src/peer_list.cpp b/src/peer_list.cpp
+index 615f79f..a355c6b 100644
+--- a/src/peer_list.cpp
++++ b/src/peer_list.cpp
+@@ -46,6 +46,8 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/random.hpp"
+ #include "libtorrent/extensions.hpp"
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
++#include "libtorrent/identify_client.hpp"
+ #include "libtorrent/torrent_peer_allocator.hpp"
+ #include "libtorrent/ip_voter.hpp" // for external_ip
+ #include "libtorrent/broadcast_socket.hpp" // for is_v6
+@@ -291,6 +293,77 @@ namespace libtorrent {
+ 		}
+ 	}
+ 
++	// disconnects and removes all peers that are blocked by the peer filter
++	// (peer-id, client name or IP). Only peers with a live connection can be
++	// evaluated, since the peer-id is only known once the handshake has
++	// been received. Peers without a connection are re-evaluated when they
++	// connect. Blocked connections are disconnected and their peer entries
++	// removed from the peer list, regardless of whether the connection
++	// comes from an internal or external address.
++	void peer_list::apply_peer_filter(peer_filter const& filter
++		, torrent_state* state, std::vector<address>& banned)
++	{
++		TORRENT_ASSERT(is_single_thread());
++		INVARIANT_CHECK;
++
++		for (iterator i = m_peers.begin(); i != m_peers.end();)
++		{
++			if ((*i)->connection == nullptr)
++			{
++				++i;
++				continue;
++			}
++			peer_connection_interface* p = (*i)->connection;
++			peer_id const& pid = p->pid();
++			address const remote_addr = p->remote().address();
++			// evaluate both the client name derived from the peer-id and
++			// the client version advertised in the BEP 10 extended
++			// handshake ("v" field), which may be more truthful for
++			// clients that spoof their peer-id
++			std::string const& client_version = p->client_version();
++			bool const blocked = filter.peer_blocked(pid
++					, aux::identify_client_impl(pid), remote_addr)
++				|| (!client_version.empty()
++					&& filter.peer_blocked(pid, client_version, remote_addr));
++			if (!blocked)
++			{
++				++i;
++				continue;
++			}
++			if (*i == m_locked_peer)
++			{
++				++i;
++				continue;
++			}
++
++			int const current = int(i - m_peers.begin());
++			TORRENT_ASSERT(current >= 0);
++			TORRENT_ASSERT(m_peers.size() > 0);
++			TORRENT_ASSERT(i != m_peers.end());
++
++			// disconnecting the peer here may also delete the
++			// peer_info_struct. If that is the case, just continue
++			int count = int(m_peers.size());
++
++			banned.push_back(remote_addr);
++
++			p->disconnect(errors::banned_by_client_filter
++				, operation_t::bittorrent);
++
++			// what *i refers to has changed, i.e. cur was deleted
++			if (int(m_peers.size()) < count)
++			{
++				i = m_peers.begin() + current;
++				continue;
++			}
++			TORRENT_ASSERT((*i)->connection == nullptr
++				|| (*i)->connection->peer_info_struct() == nullptr);
++
++			erase_peer(i, state);
++			i = m_peers.begin() + current;
++		}
++	}
++
+ 	void peer_list::erase_peer(torrent_peer* p, torrent_state* state)
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+diff --git a/src/session_handle.cpp b/src/session_handle.cpp
+index d946f4f..403da3e 100644
+--- a/src/session_handle.cpp
++++ b/src/session_handle.cpp
+@@ -848,6 +848,17 @@ namespace {
+ 		async_call(&session_impl::set_port_filter, f);
+ 	}
+ 
++	void session_handle::set_peer_filter(peer_filter const& f)
++	{
++		std::shared_ptr<peer_filter> copy = std::make_shared<peer_filter>(f);
++		async_call(&session_impl::set_peer_filter, copy);
++	}
++
++	peer_filter session_handle::get_peer_filter() const
++	{
++		return sync_call_ret<peer_filter>(&session_impl::get_peer_filter);
++	}
++
+ #if TORRENT_ABI_VERSION == 1
+ 	void session_handle::set_peer_id(peer_id const& id)
+ 	{
+diff --git a/src/session_impl.cpp b/src/session_impl.cpp
+index 1704d7d..02b3ce2 100644
+--- a/src/session_impl.cpp
++++ b/src/session_impl.cpp
+@@ -63,6 +63,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/bt_peer_connection.hpp"
+ #include "libtorrent/peer_connection_handle.hpp"
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/socket.hpp"
+ #include "libtorrent/aux_/session_impl.hpp"
+ #ifndef TORRENT_DISABLE_DHT
+@@ -530,6 +531,25 @@ namespace aux {
+ 		, m_close_file_timer(m_io_service)
+ 		, m_paused(flags & session::paused)
+ 	{
++		// if a rules.txt file is present in the process' current working
++		// directory, load it as the initial peer filter
++		error_code ec;
++		peer_filter pf;
++		if (load_peer_filter_file("rules.txt", pf, ec))
++		{
++			m_peer_filter = std::make_shared<peer_filter>(std::move(pf));
++#ifndef TORRENT_DISABLE_LOGGING
++			session_log("loaded peer filter from rules.txt");
++#endif
++		}
++		else if (ec && ec != boost::system::errc::no_such_file_or_directory
++			&& m_alerts.should_post<session_error_alert>())
++		{
++			// only unexpected failures are reported; a missing file
++			// simply means no initial peer filter
++			m_alerts.emplace_alert<session_error_alert>(ec
++				, "failed to load peer filter rules.txt");
++		}
+ 	}
+ 
+ 	template <typename Fun, typename... Args>
+@@ -1108,6 +1128,18 @@ namespace aux {
+ 			i.second->set_ip_filter(m_ip_filter);
+ 	}
+ 
++	void session_impl::set_peer_filter(std::shared_ptr<peer_filter> const& f)
++	{
++		INVARIANT_CHECK;
++
++		m_peer_filter = f;
++
++		// Close connections whose peer-id, client name or endpoint
++		// is filtered by the new peer-filter
++		for (auto& i : m_torrents)
++			i.second->set_peer_filter(m_peer_filter);
++	}
++
+ 	void session_impl::ban_ip(address addr)
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+@@ -1124,6 +1156,13 @@ namespace aux {
+ 		return *m_ip_filter;
+ 	}
+ 
++	peer_filter const& session_impl::get_peer_filter()
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (!m_peer_filter) m_peer_filter = std::make_shared<peer_filter>();
++		return *m_peer_filter;
++	}
++
+ 	port_filter const& session_impl::get_port_filter() const
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+@@ -1422,9 +1461,6 @@ namespace {
+ 			|| (pack.has_val(settings_pack::proxy_type)
+ 				&& pack.get_int(settings_pack::proxy_type)
+ 					!= m_settings.get_int(settings_pack::proxy_type))
+-			|| (pack.has_val(settings_pack::proxy_peer_connections)
+-				&& pack.get_bool(settings_pack::proxy_peer_connections)
+-					!= m_settings.get_bool(settings_pack::proxy_peer_connections))
+ 			;
+ 
+ #ifndef TORRENT_DISABLE_LOGGING
+@@ -1899,24 +1935,8 @@ namespace {
+ 		// of a new socket failing to bind due to a conflict with a stale socket
+ 		std::vector<listen_endpoint_t> eps;
+ 
+-		// if we don't proxy peer connections, don't apply the special logic for
+-		// proxies
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-		{
+-			// we will be able to accept incoming connections over UDP. so use
+-			// one of the ports the user specified to use a consistent port
+-			// across sessions. If the user did not specify any ports, pick one
+-			// at random
+-			int const port = m_listen_interfaces.empty()
+-				? int(random(63000) + 2000)
+-				: m_listen_interfaces.front().port;
+-			listen_endpoint_t ep(address_v4::any(), port, {}
+-				, transport::plaintext, listen_socket_t::proxy);
+-			eps.emplace_back(ep);
+-		}
+-		else
+ 		{
++
+ 			std::vector<ip_interface> const ifs = enum_net_interfaces(m_io_service, ec);
+ 			if (ec && m_alerts.should_post<listen_failed_alert>())
+ 			{
+@@ -2676,12 +2696,6 @@ namespace {
+ 		}
+ 		async_accept(listener, ssl);
+ 
+-		// don't accept any connections from our local sockets if we're using a
+-		// proxy
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-			return;
+-
+ 		auto listen = std::find_if(m_listen_sockets.begin(), m_listen_sockets.end()
+ 			, [&listener](std::shared_ptr<listen_socket_t> const& l)
+ 		{ return l->sock == listener; });
+@@ -4843,6 +4857,7 @@ namespace {
+ 		}
+ 
+ 		torrent_ptr->set_ip_filter(m_ip_filter);
++		torrent_ptr->set_peer_filter(m_peer_filter);
+ 		torrent_ptr->start();
+ 
+ #ifndef TORRENT_DISABLE_EXTENSIONS
+@@ -5536,10 +5551,6 @@ namespace {
+ 			return std::uint16_t(sock->tcp_external_port());
+ 		}
+ 
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-			return 0;
+-
+ 		for (auto const& s : m_listen_sockets)
+ 		{
+ 			if (!(s->flags & listen_socket_t::accept_incoming)) continue;
+diff --git a/src/torrent.cpp b/src/torrent.cpp
+index a01018b..15e93d4 100644
+--- a/src/torrent.cpp
++++ b/src/torrent.cpp
+@@ -82,6 +82,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/peer_class.hpp" // for peer_class
+ #include "libtorrent/socket_io.hpp" // for read_*_endpoint
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/request_blocks.hpp"
+ #include "libtorrent/performance_counters.hpp" // for counters
+ #include "libtorrent/resolver_interface.hpp"
+@@ -778,6 +779,7 @@ bool is_downloading_state(int const st)
+ 
+ 		m_apply_ip_filter = b;
+ 		ip_filter_updated();
++		peer_filter_updated();
+ 		state_updated();
+ 	}
+ 
+@@ -788,6 +790,13 @@ bool is_downloading_state(int const st)
+ 		ip_filter_updated();
+ 	}
+ 
++	void torrent::set_peer_filter(std::shared_ptr<const peer_filter> f)
++	{
++		m_peer_filter = std::move(f);
++		if (!m_apply_ip_filter) return;
++		peer_filter_updated();
++	}
++
+ #ifndef TORRENT_DISABLE_DHT
+ 	bool torrent::should_announce_dht() const
+ 	{
+@@ -10644,6 +10653,28 @@ bool is_downloading_state(int const st)
+ 		peers_erased(st.erased);
+ 	}
+ 
++	void torrent::peer_filter_updated()
++	{
++		if (!m_apply_ip_filter) return;
++		if (!m_peer_list) return;
++		if (!m_peer_filter) return;
++		if (m_peer_filter->empty()) return;
++
++		torrent_state st = get_peer_list_state();
++		std::vector<address> banned;
++		m_peer_list->apply_peer_filter(*m_peer_filter, &st, banned);
++
++		if (alerts().should_post<peer_blocked_alert>())
++		{
++			for (auto const& addr : banned)
++				alerts().emplace_alert<peer_blocked_alert>(get_handle()
++					, tcp::endpoint(addr, 0)
++					, peer_blocked_alert::peer_filter);
++		}
++
++		peers_erased(st.erased);
++	}
++
+ 	// this is called when torrent_peers are removed from the peer_list
+ 	// (peer-list). It removes any references we may have to those torrent_peers,
+ 	// so we don't leave then dangling
