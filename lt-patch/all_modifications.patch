@@ -1,0 +1,2841 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff9d60a..e017af7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -106,6 +106,7 @@ set(libtorrent_include_files
+ 	peer_connection.hpp
+ 	peer_connection_handle.hpp
+ 	peer_connection_interface.hpp
++	peer_filter.hpp
+ 	peer_id.hpp
+ 	peer_info.hpp
+ 	peer_list.hpp
+@@ -341,6 +342,7 @@ set(sources
+ 	peer_class_set.cpp
+ 	peer_connection.cpp
+ 	peer_connection_handle.cpp
++	peer_filter.cpp
+ 	peer_info.cpp
+ 	peer_list.cpp
+ 	performance_counters.cpp
+diff --git a/Jamfile b/Jamfile
+index 5ec7447..1b30955 100644
+--- a/Jamfile
++++ b/Jamfile
+@@ -650,6 +650,7 @@ SOURCES =
+ 	web_peer_connection
+ 	http_seed_connection
+ 	peer_connection_handle
++	peer_filter
+ 	i2p_stream
+ 	instantiate_connection
+ 	lazy_bdecode
+diff --git a/include/libtorrent/Makefile.am b/include/libtorrent/Makefile.am
+index eb8841c..e47cc41 100644
+--- a/include/libtorrent/Makefile.am
++++ b/include/libtorrent/Makefile.am
+@@ -86,6 +86,7 @@ nobase_include_HEADERS = \
+   peer_connection.hpp          \
+   peer_connection_handle.hpp   \
+   peer_connection_interface.hpp \
++  peer_filter.hpp               \
+   peer.hpp                     \
+   peer_class.hpp               \
+   peer_class_set.hpp           \
+diff --git a/include/libtorrent/alert_types.hpp b/include/libtorrent/alert_types.hpp
+index 18c1dae..ed17efc 100644
+--- a/include/libtorrent/alert_types.hpp
++++ b/include/libtorrent/alert_types.hpp
+@@ -1731,6 +1731,7 @@ TORRENT_VERSION_NAMESPACE_2
+ 	// * the port filter
+ 	// * the peer has a low port and ``no_connect_privileged_ports`` is enabled
+ 	// * the protocol of the peer is blocked (uTP/TCP blocking)
++	// * the peer filter (peer-id, client name or IP)
+ 	struct TORRENT_EXPORT peer_blocked_alert final : peer_alert
+ 	{
+ 		// internal
+@@ -1751,7 +1752,8 @@ TORRENT_VERSION_NAMESPACE_2
+ 			utp_disabled,
+ 			tcp_disabled,
+ 			invalid_local_interface,
+-			ssrf_mitigation
++			ssrf_mitigation,
++			peer_filter
+ 		};
+ 
+ 		// the reason for the peer being blocked. Is one of the values from the
+diff --git a/include/libtorrent/aux_/session_impl.hpp b/include/libtorrent/aux_/session_impl.hpp
+index 9feaead..05aa395 100644
+--- a/include/libtorrent/aux_/session_impl.hpp
++++ b/include/libtorrent/aux_/session_impl.hpp
+@@ -56,6 +56,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/debug.hpp"
+ #include "libtorrent/piece_block_progress.hpp"
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/aux_/ip_notifier.hpp"
+ #include "libtorrent/session_status.hpp"
+ #include "libtorrent/add_torrent_params.hpp"
+@@ -103,6 +104,12 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include <cstdarg> // for va_start, va_end
+ #include <unordered_map>
+ 
++#include <boost/multi_index_container.hpp>
++#include <boost/multi_index/hashed_index.hpp>
++#include <boost/multi_index/sequenced_index.hpp>
++#include <boost/multi_index/member.hpp>
++#include <unordered_set>
++
+ namespace libtorrent {
+ 
+ 	struct plugin;
+@@ -537,9 +544,14 @@ namespace aux {
+ 			void set_ip_filter(std::shared_ptr<ip_filter> const& f);
+ 			ip_filter const& get_ip_filter();
+ 
++			void set_peer_filter(std::shared_ptr<peer_filter> const& f);
++			peer_filter const& get_peer_filter();
++
+ 			void set_port_filter(port_filter const& f);
+ 			port_filter const& get_port_filter() const override;
+ 			void ban_ip(address addr) override;
++			void ban_ip_temp(address addr) override;
++			bool is_temp_banned(address const& addr) override;
+ 
+ 			void queue_tracker_request(tracker_request&& req
+ 				, std::weak_ptr<request_callback> c) override;
+@@ -977,6 +989,10 @@ namespace aux {
+ 			// object. It is the complete list of all connected
+ 			// peers.
+ 			connection_map m_connections;
++			std::unordered_map<address, std::unordered_set<peer_connection*>> m_connections_by_ip;
++			std::unordered_map<peer_connection*, address> m_connection_addresses;
++			std::unordered_set<address> m_pending_temp_ban_disconnects;
++			bool m_temp_ban_disconnect_posted = false;
+ 
+ 			// this list holds incoming connections while they
+ 			// are performing SSL handshake. When we shut down
+@@ -995,6 +1011,42 @@ namespace aux {
+ 			// filters incoming connections
+ 			std::shared_ptr<ip_filter> m_ip_filter;
+ 
++			// filters incoming and outgoing peer connections based on
++			// peer-id, client name or IP address
++			std::shared_ptr<peer_filter> m_peer_filter;
++
++			friend struct temp_ban_test_access;
++			void ban_ip_temp_at(address addr, monotonic_time_point now);
++			void disconnect_temp_banned_ip(address addr);
++			bool is_temp_banned_at(address const& addr, monotonic_time_point now) const;
++
++			struct temp_ban_entry
++			{
++				address addr;
++				monotonic_time_point expiry;
++			};
++
++			struct temp_ban_address_hash
++			{
++				std::size_t operator()(address const& a) const
++				{ return std::hash<address>()(a); }
++			};
++
++			using temp_ban_container = boost::multi_index_container<
++				temp_ban_entry,
++				boost::multi_index::indexed_by<
++					boost::multi_index::hashed_unique<
++						boost::multi_index::member<temp_ban_entry, address
++							, &temp_ban_entry::addr>
++						, temp_ban_address_hash>,
++					boost::multi_index::sequenced<>
++				>>;
++
++			temp_ban_container m_temp_ban;
++			monotonic_time_point m_temp_ban_time;
++			monotonic_duration const m_temp_ban_duration = seconds(3600);
++			std::size_t const m_temp_ban_max_size = 65536;
++
+ 			// filters outgoing connections
+ 			port_filter m_port_filter;
+ 
+diff --git a/include/libtorrent/aux_/session_interface.hpp b/include/libtorrent/aux_/session_interface.hpp
+index 9d8a291..c7412a9 100644
+--- a/include/libtorrent/aux_/session_interface.hpp
++++ b/include/libtorrent/aux_/session_interface.hpp
+@@ -169,6 +169,8 @@ namespace aux {
+ 		// port filter
+ 		virtual port_filter const& get_port_filter() const = 0;
+ 		virtual void ban_ip(address addr) = 0;
++		virtual void ban_ip_temp(address addr) = 0;
++		virtual bool is_temp_banned(address const& addr) = 0;
+ 
+ 		virtual std::uint16_t session_time() const = 0;
+ 		virtual time_point session_start_time() const = 0;
+diff --git a/include/libtorrent/aux_/time.hpp b/include/libtorrent/aux_/time.hpp
+index a70d400..d64a46b 100644
+--- a/include/libtorrent/aux_/time.hpp
++++ b/include/libtorrent/aux_/time.hpp
+@@ -44,6 +44,10 @@ namespace libtorrent { namespace aux {
+ 	// resolution of this timer is about 100 ms.
+ 	TORRENT_EXTRA_EXPORT time_point time_now();
+ 	TORRENT_EXTRA_EXPORT time_point32 time_now32();
++
++	// returns the current time of a monotonic clock, unaffected by
++	// wall-clock adjustments
++	TORRENT_EXTRA_EXPORT monotonic_time_point monotonic_time_now();
+ 	
+ 	TORRENT_EXTRA_EXPORT std::time_t to_time_t(time_point32 tp);
+ 	TORRENT_EXTRA_EXPORT time_point32 from_time_t(std::time_t t);
+diff --git a/include/libtorrent/bt_peer_connection.hpp b/include/libtorrent/bt_peer_connection.hpp
+index 66a8b11..b842c3a 100644
+--- a/include/libtorrent/bt_peer_connection.hpp
++++ b/include/libtorrent/bt_peer_connection.hpp
+@@ -108,6 +108,9 @@ namespace libtorrent {
+ 
+ 		peer_id our_pid() const override { return m_our_peer_id; }
+ 
++		std::string const& client_version() const override
++		{ return m_client_version; }
++
+ #if !defined TORRENT_DISABLE_ENCRYPTION
+ 		bool supports_encryption() const
+ 		{ return m_encrypted; }
+diff --git a/include/libtorrent/error_code.hpp b/include/libtorrent/error_code.hpp
+index 17a752a..ef97071 100644
+--- a/include/libtorrent/error_code.hpp
++++ b/include/libtorrent/error_code.hpp
+@@ -329,6 +329,9 @@ namespace libtorrent {
+ 			ssrf_mitigation,
+ 			// blocked because IDNA host names are banned
+ 			blocked_by_idna,
++			// The peer was blocked by the peer filter
++			// (peer-id, client name or IP blacklist)
++			banned_by_client_filter,
+ 
+ #if TORRENT_ABI_VERSION == 1
+ 			// these error codes are deprecated, NAT-PMP/PCP error codes have
+diff --git a/include/libtorrent/fwd.hpp b/include/libtorrent/fwd.hpp
+index d518063..179ece6 100644
+--- a/include/libtorrent/fwd.hpp
++++ b/include/libtorrent/fwd.hpp
+@@ -192,6 +192,9 @@ class hasher512;
+ struct ip_filter;
+ class port_filter;
+ 
++// include/libtorrent/peer_filter.hpp
++class peer_filter;
++
+ // include/libtorrent/kademlia/dht_settings.hpp
+ namespace dht {
+ struct dht_settings;
+diff --git a/include/libtorrent/peer_connection_interface.hpp b/include/libtorrent/peer_connection_interface.hpp
+index cada62f..5c115d7 100644
+--- a/include/libtorrent/peer_connection_interface.hpp
++++ b/include/libtorrent/peer_connection_interface.hpp
+@@ -60,6 +60,13 @@ namespace libtorrent {
+ 			, operation_t op, disconnect_severity_t = peer_connection_interface::normal) = 0;
+ 		virtual peer_id const& pid() const = 0;
+ 		virtual peer_id our_pid() const = 0;
++		// returns the client version advertised by the peer in the BEP 10
++		// extended handshake ("v" field). This may be more truthful than
++		// the client derived from the peer-id, which some clients spoof.
++		// Empty if not known (i.e. before the extended handshake has been
++		// received, or not applicable to this connection type).
++		virtual std::string const& client_version() const
++		{ static std::string const empty; return empty; }
+ 		virtual void set_holepunch_mode() = 0;
+ 		virtual torrent_peer* peer_info_struct() const = 0;
+ 		virtual void set_peer_info(torrent_peer* pi) = 0;
+diff --git a/include/libtorrent/peer_filter.hpp b/include/libtorrent/peer_filter.hpp
+new file mode 100644
+index 0000000..9f5f4a4
+--- /dev/null
++++ b/include/libtorrent/peer_filter.hpp
+@@ -0,0 +1,177 @@
++/*
++
++Copyright (c) 2005-2018, Arvid Norberg
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions
++are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the distribution.
++    * Neither the name of the author nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++*/
++
++#ifndef TORRENT_PEER_FILTER_HPP_INCLUDED
++#define TORRENT_PEER_FILTER_HPP_INCLUDED
++
++#include <string>
++#include <vector>
++#include <regex>
++#include <memory>
++#include <mutex>
++#include <unordered_map>
++
++#include "libtorrent/config.hpp"
++#include "libtorrent/address.hpp"
++#include "libtorrent/error_code.hpp"
++#include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_id.hpp"
++
++namespace libtorrent {
++
++// The ``peer_filter`` class is a set of rules used to reject incoming and
++// outgoing peer connections based on any of:
++//
++// * the peer-id (matched by prefix or regular expression)
++// * the client name (matched by case-insensitive sub-string or regular
++//   expression). Both the name derived from the peer-id (see
++//   identify_client) and the client version advertised in the BEP 10
++//   extended handshake ("v" field) are evaluated. The latter may be more
++//   truthful, since some clients spoof their peer-id; connections are
++//   re-checked when the extended handshake arrives.
++// * the remote IP address
++//
++// A default constructed peer_filter does not filter any peer.
++//
++// Note that IP rules are only enforced once the bittorrent handshake has been
++// received (or re-applied to already connected peers when the filter is
++// updated). The ``ip_filter`` is enforced earlier (when dialing or accepting
++// connections), so for pure IP blocking prefer ``ip_filter``.
++//
++// IPv4-mapped IPv6 addresses (e.g. ``::ffff:10.0.0.5``) are treated as plain
++// IPv4 addresses when matching IP rules.
++//
++// Connections matching peer-id or client name rules are always disconnected
++// and removed from the peer list, including connections from internal
++// addresses. Since the disconnect and peer-list removal only affect the
++// single connection (ip:port), other connections from the same internal IP
++// (e.g. reverse-proxy setups) are unaffected. Explicit IP rules are applied
++// as-is.
++//
++// ``peer_blocked()`` is thread-safe and memoizes the result of the peer-id
++// and client-name rules in a bounded cache, so repeated lookups of the same
++// peer-id or client name only pay for a hash lookup. The IP rules are not
++// cached and are evaluated on every call. Adding or clearing rules must not
++// run concurrently with lookups.
++class TORRENT_EXPORT peer_filter
++{
++public:
++
++	// Adds a rule to block all peers whose peer-id starts with ``prefix``.
++	// The prefix is truncated to 20 bytes (the size of a peer-id). An empty
++	// prefix is ignored.
++	void add_peer_id(std::string const& prefix);
++
++	// Adds a rule to block all peers whose client name contains ``client``
++	// (case-insensitive). An empty string is ignored.
++	void add_client(std::string const& client);
++
++	// Adds a rule to block all peers whose peer-id matches the ECMAScript
++	// regular expression ``pattern`` (partial match, ``std::regex_search``).
++	// On invalid pattern, ``ec`` is set to errors::parse_failed and no rule
++	// is added. An empty pattern is ignored.
++	void add_peer_id_regex(std::string const& pattern, error_code& ec);
++
++	// Adds a rule to block all peers whose client name matches the
++	// ECMAScript regular expression ``pattern`` (partial match,
++	// ``std::regex_search``). On invalid pattern, ``ec`` is set to
++	// errors::parse_failed and no rule is added. An empty pattern is ignored.
++	void add_client_regex(std::string const& pattern, error_code& ec);
++
++	// Adds an IP rule. Equivalent to ip_filter::add_rule(). Only ranges
++	// flagged with ``ip_filter::blocked`` are honored by this filter.
++	void add_rule(address const& first, address const& last, std::uint32_t flags);
++
++	// Removes all rules from the filter.
++	void clear();
++
++	// Returns true if the filter does not block anything.
++	bool empty() const;
++
++	// Returns true if the peer described by the given ``pid``, ``client``
++	// name and remote ``addr`` is blocked by any rule in this filter.
++	bool peer_blocked(peer_id const& pid, std::string const& client
++		, address const& addr) const;
++
++private:
++
++	struct cache_state
++	{
++		std::mutex mutex;
++		std::unordered_map<std::string, bool> peer_ids;
++		std::unordered_map<std::string, bool> clients;
++	};
++
++	std::shared_ptr<cache_state> m_cache = std::make_shared<cache_state>();
++	ip_filter m_ip_filter;
++	std::vector<std::string> m_peer_ids;
++	std::vector<std::string> m_clients;
++	std::vector<std::regex> m_peer_id_regexes;
++	std::vector<std::regex> m_client_regexes;
++	bool m_has_ip_rules = false;
++};
++
++// Returns true for internal addresses: RFC 1918 private ranges
++// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback, IPv4 link-local
++// (169.254.0.0/16) and IPv6 loopback, link-local (fe80::/10) and
++// unique-local (fc00::/7) addresses. IPv4-mapped IPv6 addresses are
++// evaluated as their embedded IPv4 address.
++TORRENT_EXPORT bool is_internal_address(address const& addr);
++
++// Loads a peer_filter from the file at ``path``. Each non-empty line in the
++// file that does not start with '#' is a rule. A rule consists of a keyword
++// and an argument, separated by whitespace:
++//
++// 	ip <addr>[/prefix] | <addr>-<addr>
++// 		block a single IP address, an IP range or a subnet (IPv4 and IPv6)
++// 	peer <peer-id-prefix>
++// 		block peers whose peer-id starts with the given prefix
++// 		(e.g. "-XL0012-")
++// 	client <substring>
++// 		block peers whose client name contains the given sub-string
++// 		(case-insensitive)
++// 	peer-regex <pattern>
++// 		block peers whose peer-id matches the given ECMAScript regular
++// 		expression (e.g. "-XL[0-9]{4}-")
++// 	client-regex <pattern>
++// 		block peers whose client name matches the given ECMAScript regular
++// 		expression (e.g. ".*[Xx]unlei.*")
++//
++// Rules are added to ``out``, which may already contain rules. Returns true
++// on success and false on failure, in which case ``ec`` is set. ``out`` may
++// be left partially updated on failure.
++TORRENT_EXPORT bool load_peer_filter_file(std::string const& path
++	, peer_filter& out, error_code& ec);
++
++}
++
++#endif // TORRENT_PEER_FILTER_HPP_INCLUDED
+diff --git a/include/libtorrent/peer_list.hpp b/include/libtorrent/peer_list.hpp
+index 6ada298..81fbf27 100644
+--- a/include/libtorrent/peer_list.hpp
++++ b/include/libtorrent/peer_list.hpp
+@@ -140,6 +140,8 @@ namespace libtorrent {
+ 			, std::vector<address>& banned);
+ 		void apply_port_filter(port_filter const& filter, torrent_state* state
+ 			, std::vector<address>& banned);
++		void apply_peer_filter(peer_filter const& filter, torrent_state* state
++			, std::vector<address>& banned);
+ 
+ 		void set_seed(torrent_peer* p, bool s);
+ 
+diff --git a/include/libtorrent/session_handle.hpp b/include/libtorrent/session_handle.hpp
+index 0cbd4a2..a2b36ce 100644
+--- a/include/libtorrent/session_handle.hpp
++++ b/include/libtorrent/session_handle.hpp
+@@ -620,6 +620,22 @@ namespace libtorrent {
+ 		// anti-virus software by connecting to SMTP, FTP ports.
+ 		void set_port_filter(port_filter const& f);
+ 
++		// Sets a filter that will be used to reject incoming as well as
++		// outgoing peer connections based on their peer-id, client name or
++		// originating ip address. The default filter does not block anything.
++		// To build a set of rules, see peer_filter. To load rules from a file,
++		// see load_peer_filter_file().
++		//
++		// When the session starts, if a file named ``rules.txt`` exists in
++		// the process' current working directory, it is automatically loaded
++		// as the initial peer filter.
++		//
++		// Each time a peer is blocked because of the peer filter, a
++		// peer_blocked_alert is generated. ``get_peer_filter()`` returns the
++		// peer_filter currently in the session. See peer_filter.
++		void set_peer_filter(peer_filter const& f);
++		peer_filter get_peer_filter() const;
++
+ #if TORRENT_ABI_VERSION == 1
+ 		// deprecated in 1.1, use settings_pack::peer_fingerprint instead
+ 		TORRENT_DEPRECATED
+diff --git a/include/libtorrent/time.hpp b/include/libtorrent/time.hpp
+index d037311..a182748 100644
+--- a/include/libtorrent/time.hpp
++++ b/include/libtorrent/time.hpp
+@@ -55,6 +55,15 @@ namespace libtorrent {
+ 	using time_point = clock_type::time_point;
+ 	using time_duration = clock_type::duration;
+ 
++#if defined TORRENT_BUILD_SIMULATOR
++	using monotonic_clock = sim::chrono::high_resolution_clock;
++#else
++	using monotonic_clock = std::chrono::steady_clock;
++#endif
++
++	using monotonic_time_point = monotonic_clock::time_point;
++	using monotonic_duration = monotonic_clock::duration;
++
+ 	// 32 bit versions of time_point and duration, with second resolution
+ 	using seconds32 = std::chrono::duration<std::int32_t>;
+ 	using minutes32 = std::chrono::duration<std::int32_t, std::ratio<60>>;
+diff --git a/include/libtorrent/torrent.hpp b/include/libtorrent/torrent.hpp
+index 5ba83b0..bd9483f 100644
+--- a/include/libtorrent/torrent.hpp
++++ b/include/libtorrent/torrent.hpp
+@@ -506,8 +506,11 @@ namespace libtorrent {
+ 		void received_synack(bool ipv6);
+ 
+ 		void set_ip_filter(std::shared_ptr<const ip_filter> ipf);
++		void set_peer_filter(std::shared_ptr<const peer_filter> f);
+ 		void port_filter_updated();
+ 		ip_filter const* get_ip_filter() { return m_ip_filter.get(); }
++		std::shared_ptr<const peer_filter> get_peer_filter() const
++		{ return m_apply_ip_filter ? m_peer_filter : nullptr; }
+ 
+ 		std::string resolve_filename(file_index_t file) const;
+ 		void handle_exception();
+@@ -1206,6 +1209,7 @@ namespace libtorrent {
+ 		void on_remove_peers() noexcept;
+ 
+ 		void ip_filter_updated();
++		void peer_filter_updated();
+ 
+ 		void inc_stats_counter(int c, int value = 1);
+ 
+@@ -1260,6 +1264,10 @@ namespace libtorrent {
+ 
+ 		std::shared_ptr<const ip_filter> m_ip_filter;
+ 
++		// filters incoming and outgoing peer connections based on
++		// peer-id, client name or IP address
++		std::shared_ptr<const peer_filter> m_peer_filter;
++
+ 		// all time totals of uploaded and downloaded payload
+ 		// stored in resume data
+ 		std::int64_t m_total_uploaded = 0;
+diff --git a/src/Makefile.am b/src/Makefile.am
+index ea25a89..d3c16b0 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -101,6 +101,7 @@ libtorrent_rasterbar_la_SOURCES = \
+   performance_counters.cpp        \
+   peer_connection.cpp             \
+   peer_connection_handle.cpp      \
++  peer_filter.cpp                 \
+   peer_class.cpp                  \
+   peer_class_set.cpp              \
+   piece_picker.cpp                \
+diff --git a/src/alert.cpp b/src/alert.cpp
+index 1e24a4d..e33dffa 100644
+--- a/src/alert.cpp
++++ b/src/alert.cpp
+@@ -1402,7 +1402,8 @@ namespace {
+ 			"utp_disabled",
+ 			"tcp_disabled",
+ 			"invalid_local_interface",
+-			"ssrf_mitigation"
++			"ssrf_mitigation",
++			"peer_filter"
+ 		};
+ 
+ 		std::snprintf(ret, sizeof(ret), "%s: blocked peer [%s]"
+diff --git a/src/bt_peer_connection.cpp b/src/bt_peer_connection.cpp
+index 3ce0d8d..5f32098 100644
+--- a/src/bt_peer_connection.cpp
++++ b/src/bt_peer_connection.cpp
+@@ -44,6 +44,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/bt_peer_connection.hpp"
+ #include "libtorrent/session.hpp"
+ #include "libtorrent/identify_client.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/entry.hpp"
+ #include "libtorrent/bencode.hpp"
+ #include "libtorrent/alert_types.hpp"
+@@ -1754,6 +1755,24 @@ namespace {
+ 			verify_encoding(m_client_version);
+ 		}
+ 
++		// The client version advertised in the extended handshake may be
++		// more truthful than the peer-id (which some clients spoof).
++		// Re-evaluate the peer filter with the real client version.
++		if (std::shared_ptr<const peer_filter> const pf = t->get_peer_filter())
++		{
++			if (pf->peer_blocked(pid(), m_client_version, remote().address()))
++			{
++				if (!is_internal_address(remote().address()))
++					m_ses.ban_ip_temp(remote().address());
++				if (t->alerts().should_post<peer_blocked_alert>())
++					t->alerts().emplace_alert<peer_blocked_alert>(t->get_handle()
++						, remote(), peer_blocked_alert::peer_filter);
++				disconnect(errors::banned_by_client_filter
++					, operation_t::bittorrent);
++				return;
++			}
++		}
++
+ 		int const reqq = int(root.dict_find_int_value("reqq"));
+ 		if (reqq > 0) max_out_request_queue(reqq);
+ 
+@@ -3214,6 +3233,24 @@ namespace {
+ 
+ 			set_pid(pid);
+ 			m_client_version = identify_client(pid);
++
++			// if the peer is blocked by the peer filter (peer-id, client
++			// name or IP), close the connection
++			if (std::shared_ptr<const peer_filter> const pf = t->get_peer_filter())
++			{
++				if (pf->peer_blocked(pid, m_client_version, remote().address()))
++				{
++					if (!is_internal_address(remote().address()))
++						m_ses.ban_ip_temp(remote().address());
++					if (t->alerts().should_post<peer_blocked_alert>())
++						t->alerts().emplace_alert<peer_blocked_alert>(t->get_handle()
++							, remote(), peer_blocked_alert::peer_filter);
++					disconnect(errors::banned_by_client_filter
++						, operation_t::bittorrent);
++					return;
++				}
++			}
++
+ 			if (pid[0] == '-' && pid[1] == 'B' && pid[2] == 'C' && pid[7] == '-')
+ 			{
+ 				// if this is a bitcomet client, lower the request queue size limit
+diff --git a/src/close_reason.cpp b/src/close_reason.cpp
+index c64768d..f6d09fb 100644
+--- a/src/close_reason.cpp
++++ b/src/close_reason.cpp
+@@ -119,6 +119,7 @@ namespace libtorrent {
+ 				TORRENT_MAP(invalid_ssl_cert, close_reason_t::blocked)
+ 				TORRENT_MAP(not_an_ssl_torrent, close_reason_t::blocked)
+ 				TORRENT_MAP(banned_by_port_filter, close_reason_t::port_blocked)
++				TORRENT_MAP(banned_by_client_filter, close_reason_t::blocked)
+ 
+ #ifdef TORRENT_USE_ASSERTS
+ 				case errors::redirecting:
+diff --git a/src/error_code.cpp b/src/error_code.cpp
+index 7c5b76d..7f5b04e 100644
+--- a/src/error_code.cpp
++++ b/src/error_code.cpp
+@@ -174,7 +174,7 @@ namespace libtorrent {
+ 			"listen socket has been closed",
+ 			"blocked by SSRF mitigation",
+ 			"blocked by IDNA ban",
+-			"",
++			"banned by peer filter",
+ 
+ // natpmp errors
+ 			"unsupported protocol version",
+diff --git a/src/peer_filter.cpp b/src/peer_filter.cpp
+new file mode 100644
+index 0000000..95e9a11
+--- /dev/null
++++ b/src/peer_filter.cpp
+@@ -0,0 +1,449 @@
++/*
++
++Copyright (c) 2005-2018, Arvid Norberg
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions
++are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the distribution.
++    * Neither the name of the author nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++*/
++
++#include "libtorrent/peer_filter.hpp"
++#include "libtorrent/file.hpp"
++#include "libtorrent/span.hpp"
++
++#include <algorithm>
++#include <cstdint>
++#include <utility>
++
++namespace libtorrent {
++
++namespace {
++
++	std::string lower_ascii(std::string str)
++	{
++		for (char& c : str)
++			if (c >= 'A' && c <= 'Z') c = char(c + ('a' - 'A'));
++		return str;
++	}
++
++	// client version strings longer than this are matched without caching,
++	// to keep the cache bounded in memory
++	std::size_t const max_cached_client_size = 1024;
++
++	template <typename Match>
++	bool cached_match(std::mutex& mutex
++		, std::unordered_map<std::string, bool>& cache
++		, std::string const& key, Match const& match)
++	{
++		{
++			std::lock_guard<std::mutex> lock(mutex);
++			auto const it = cache.find(key);
++			if (it != cache.end()) return it->second;
++		}
++
++		bool const result = match();
++		{
++			std::lock_guard<std::mutex> lock(mutex);
++			if (cache.find(key) == cache.end())
++			{
++				if (cache.size() >= 4096) cache.erase(cache.begin());
++				cache.emplace(key, result);
++			}
++		}
++		return result;
++	}
++
++	bool is_ws(char const c)
++	{
++		return c == ' ' || c == '\t' || c == '\r';
++	}
++
++	// converts an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to a plain
++	// IPv4 address, so IP rules written for IPv4 match such addresses too
++	address normalize_address(address const& a)
++	{
++		if (!a.is_v6()) return a;
++		address_v6::bytes_type const b = a.to_v6().to_bytes();
++		for (int i = 0; i < 10; ++i)
++			if (b[std::size_t(i)] != 0) return a;
++		if (b[10] != 0xff || b[11] != 0xff) return a;
++		address_v4::bytes_type v4 = {{ b[12], b[13], b[14], b[15] }};
++		return address(address_v4(v4));
++	}
++
++	int parse_prefix(std::string const& s, int const max, error_code& ec)
++	{
++		if (s.empty())
++		{
++			ec = errors::parse_failed;
++			return -1;
++		}
++		int ret = 0;
++		for (char const c : s)
++		{
++			if (c < '0' || c > '9')
++			{
++				ec = errors::parse_failed;
++				return -1;
++			}
++			ret = ret * 10 + (c - '0');
++			if (ret > max)
++			{
++				ec = errors::parse_failed;
++				return -1;
++			}
++		}
++		return ret;
++	}
++
++	bool parse_ip_rule(std::string const& arg, peer_filter& out, error_code& ec)
++	{
++		std::size_t const slash = arg.find('/');
++		if (slash != std::string::npos)
++		{
++			// subnet, e.g. "1.2.3.0/24" or "2001:db8::/32"
++			address const base = address::from_string(arg.substr(0, slash), ec);
++			if (ec) return false;
++
++			int const prefix = parse_prefix(arg.substr(slash + 1)
++				, base.is_v4() ? 32 : 128, ec);
++			if (ec) return false;
++
++			if (base.is_v4())
++			{
++				std::uint32_t const ip = base.to_v4().to_ulong();
++				std::uint32_t const mask = prefix == 0 ? 0U
++					: (0xffffffffU << (32 - prefix)) & 0xffffffffU;
++				std::uint32_t const first = ip & mask;
++				std::uint32_t const last = ip | ~mask;
++				out.add_rule(address_v4(first), address_v4(last)
++					, ip_filter::blocked);
++			}
++			else
++			{
++				address_v6::bytes_type const b = base.to_v6().to_bytes();
++				address_v6::bytes_type first;
++				address_v6::bytes_type last;
++				for (int i = 0; i < 16; ++i)
++				{
++					int const bits = std::max(0, std::min(8, prefix - i * 8));
++					std::uint8_t const mask = bits == 0
++						? 0 : std::uint8_t(0xff << (8 - bits));
++					first[std::size_t(i)] = std::uint8_t(b[std::size_t(i)] & mask);
++					last[std::size_t(i)] = std::uint8_t(b[std::size_t(i)] | ~mask);
++				}
++				out.add_rule(address_v6(first), address_v6(last)
++					, ip_filter::blocked);
++			}
++			return true;
++		}
++
++		std::size_t const dash = arg.find('-');
++		if (dash != std::string::npos)
++		{
++			// range, e.g. "1.2.3.4-1.2.3.10"
++			address const first = normalize_address(
++				address::from_string(arg.substr(0, dash), ec));
++			if (ec) return false;
++			address const last = normalize_address(
++				address::from_string(arg.substr(dash + 1), ec));
++			if (ec) return false;
++			if (first.is_v4() != last.is_v4())
++			{
++				ec = errors::parse_failed;
++				return false;
++			}
++			out.add_rule(first, last, ip_filter::blocked);
++			return true;
++		}
++
++		// single address
++		address const addr = normalize_address(address::from_string(arg, ec));
++		if (ec) return false;
++		out.add_rule(addr, addr, ip_filter::blocked);
++		return true;
++	}
++
++	bool parse_rule(char const* const begin, std::size_t const len
++		, peer_filter& out, error_code& ec)
++	{
++		std::size_t start = 0;
++		while (start < len && is_ws(begin[start])) ++start;
++		std::size_t end = len;
++		while (end > start && is_ws(begin[end - 1])) --end;
++		if (start == end) return true; // empty line
++		if (begin[start] == '#') return true; // comment
++
++		std::size_t kw_end = start;
++		while (kw_end < end && !is_ws(begin[kw_end])) ++kw_end;
++		std::string const keyword(begin + start, kw_end - start);
++
++		std::size_t arg_start = kw_end;
++		while (arg_start < end && is_ws(begin[arg_start])) ++arg_start;
++		std::string const arg(begin + arg_start, end - arg_start);
++
++		if (keyword == "ip")
++			return parse_ip_rule(arg, out, ec);
++		if (keyword == "peer")
++		{
++			out.add_peer_id(arg);
++			return true;
++		}
++		if (keyword == "client")
++		{
++			out.add_client(arg);
++			return true;
++		}
++		if (keyword == "peer-regex")
++		{
++			out.add_peer_id_regex(arg, ec);
++			return !ec;
++		}
++		if (keyword == "client-regex")
++		{
++			out.add_client_regex(arg, ec);
++			return !ec;
++		}
++
++		ec = errors::parse_failed;
++		return false;
++	}
++
++	// the maximum size of a rule file we accept to load into memory
++	std::size_t const max_rule_file_size = 64 * 1024 * 1024;
++
++} // anonymous namespace
++
++	bool is_internal_address(address const& a)
++	{
++		address const norm = normalize_address(a);
++		if (norm.is_v4())
++		{
++			std::uint32_t const ip = norm.to_v4().to_ulong();
++			return (ip & 0xff000000U) == 0x0a000000U // 10.0.0.0/8
++				|| (ip & 0xfff00000U) == 0xac100000U // 172.16.0.0/12
++				|| (ip & 0xffff0000U) == 0xc0a80000U // 192.168.0.0/16
++				|| (ip & 0xff000000U) == 0x7f000000U // 127.0.0.0/8
++				|| (ip & 0xffff0000U) == 0xa9fe0000U // 169.254.0.0/16
++				;
++		}
++		if (norm.is_v6())
++		{
++			if (norm.is_loopback()) return true;
++			address_v6::bytes_type const b = norm.to_v6().to_bytes();
++			if ((b[0] & 0xfe) == 0xfe) return true; // fe80::/10
++			if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7
++		}
++		return false;
++	}
++
++	void peer_filter::add_peer_id(std::string const& prefix)
++	{
++		if (prefix.empty()) return;
++		auto cache = std::make_shared<cache_state>();
++		if (prefix.size() > 20)
++			m_peer_ids.push_back(prefix.substr(0, 20));
++		else
++			m_peer_ids.push_back(prefix);
++		m_cache = std::move(cache);
++	}
++
++	void peer_filter::add_client(std::string const& client)
++	{
++		if (client.empty()) return;
++		auto cache = std::make_shared<cache_state>();
++		m_clients.push_back(lower_ascii(client));
++		m_cache = std::move(cache);
++	}
++
++	void peer_filter::add_peer_id_regex(std::string const& pattern, error_code& ec)
++	{
++		ec.clear();
++		if (pattern.empty()) return;
++		auto cache = std::make_shared<cache_state>();
++#ifndef BOOST_NO_EXCEPTIONS
++		try
++		{
++			m_peer_id_regexes.emplace_back(pattern);
++		}
++		catch (std::regex_error const&)
++		{
++			ec = errors::parse_failed;
++		}
++#else
++		m_peer_id_regexes.emplace_back(pattern);
++#endif
++		if (!ec) m_cache = std::move(cache);
++	}
++
++	void peer_filter::add_client_regex(std::string const& pattern, error_code& ec)
++	{
++		ec.clear();
++		if (pattern.empty()) return;
++		auto cache = std::make_shared<cache_state>();
++#ifndef BOOST_NO_EXCEPTIONS
++		try
++		{
++			m_client_regexes.emplace_back(pattern);
++		}
++		catch (std::regex_error const&)
++		{
++			ec = errors::parse_failed;
++		}
++#else
++		m_client_regexes.emplace_back(pattern);
++#endif
++		if (!ec) m_cache = std::move(cache);
++	}
++
++	void peer_filter::add_rule(address const& first, address const& last
++		, std::uint32_t const flags)
++	{
++		m_ip_filter.add_rule(first, last, flags);
++		if (flags & ip_filter::blocked) m_has_ip_rules = true;
++	}
++
++	void peer_filter::clear()
++	{
++		m_ip_filter = ip_filter();
++		m_peer_ids.clear();
++		m_clients.clear();
++		m_peer_id_regexes.clear();
++		m_client_regexes.clear();
++		m_has_ip_rules = false;
++		m_cache = std::make_shared<cache_state>();
++	}
++
++	bool peer_filter::empty() const
++	{
++		return !m_has_ip_rules && m_peer_ids.empty() && m_clients.empty()
++			&& m_peer_id_regexes.empty() && m_client_regexes.empty();
++	}
++
++	bool peer_filter::peer_blocked(peer_id const& pid, std::string const& client
++		, address const& addr) const
++	{
++		// normalize IPv4-mapped IPv6 addresses to plain IPv4 so that IP
++		// rules written for IPv4 match such addresses too
++		address const norm_addr = normalize_address(addr);
++
++		if (m_has_ip_rules && (m_ip_filter.access(norm_addr) & ip_filter::blocked))
++			return true;
++
++		if (!m_peer_ids.empty() || !m_peer_id_regexes.empty())
++		{
++			std::string const pid_str(pid.data(), static_cast<std::size_t>(pid.size()));
++			bool const blocked = cached_match(m_cache->mutex, m_cache->peer_ids
++				, pid_str, [this, &pid_str]
++			{
++				for (auto const& prefix : m_peer_ids)
++				{
++					if (pid_str.size() >= prefix.size()
++						&& std::equal(prefix.begin(), prefix.end(), pid_str.begin()))
++						return true;
++				}
++				for (auto const& re : m_peer_id_regexes)
++				{
++					if (std::regex_search(pid_str, re)) return true;
++				}
++				return false;
++			});
++			if (blocked) return true;
++		}
++
++		if (!client.empty() && (!m_clients.empty() || !m_client_regexes.empty()))
++		{
++			auto const client_match = [this](std::string const& c)
++			{
++				std::string const lower_client = lower_ascii(c);
++				for (auto const& rule : m_clients)
++				{
++					if (lower_client.find(rule) != std::string::npos) return true;
++				}
++				for (auto const& re : m_client_regexes)
++				{
++					if (std::regex_search(c, re)) return true;
++				}
++				return false;
++			};
++
++			if (client.size() > max_cached_client_size)
++			{
++				if (client_match(client)) return true;
++			}
++			else if (cached_match(m_cache->mutex, m_cache->clients, client
++				, [&client_match, &client] { return client_match(client); }))
++			{
++				return true;
++			}
++		}
++
++		return false;
++	}
++
++	bool load_peer_filter_file(std::string const& path, peer_filter& out
++		, error_code& ec)
++	{
++		ec.clear();
++		file f;
++		if (!f.open(path, open_mode::read_only, ec)) return false;
++
++		std::int64_t const size = f.get_size(ec);
++		if (ec || size < 0) return false;
++		if (size > std::int64_t(max_rule_file_size))
++		{
++			ec.assign(boost::system::errc::file_too_large
++				, boost::system::generic_category());
++			return false;
++		}
++
++		std::vector<char> buf(static_cast<std::size_t>(size));
++		if (size == 0) return true;
++
++		span<char> const view(buf);
++		std::int64_t const read = f.readv(0, view, ec);
++		if (ec) return false;
++		if (read != size)
++		{
++			ec.assign(boost::system::errc::io_error
++				, boost::system::generic_category());
++			return false;
++		}
++
++		std::size_t pos = 0;
++		std::size_t const len = buf.size();
++		while (pos < len)
++		{
++			std::size_t eol = pos;
++			while (eol < len && buf[eol] != '\n') ++eol;
++			if (eol > pos && !parse_rule(buf.data() + pos, eol - pos, out, ec))
++				return false;
++			pos = eol + 1;
++		}
++		return true;
++	}
++
++}
+diff --git a/src/peer_list.cpp b/src/peer_list.cpp
+index 615f79f..c25869c 100644
+--- a/src/peer_list.cpp
++++ b/src/peer_list.cpp
+@@ -46,6 +46,8 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/random.hpp"
+ #include "libtorrent/extensions.hpp"
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
++#include "libtorrent/identify_client.hpp"
+ #include "libtorrent/torrent_peer_allocator.hpp"
+ #include "libtorrent/ip_voter.hpp" // for external_ip
+ #include "libtorrent/broadcast_socket.hpp" // for is_v6
+@@ -291,6 +293,77 @@ namespace libtorrent {
+ 		}
+ 	}
+ 
++	// disconnects and removes all peers that are blocked by the peer filter
++	// (peer-id, client name or IP). Only peers with a live connection can be
++	// evaluated, since the peer-id is only known once the handshake has
++	// been received. Peers without a connection are re-evaluated when they
++	// connect. Blocked connections are disconnected and their peer entries
++	// removed from the peer list, regardless of whether the connection
++	// comes from an internal or external address.
++	void peer_list::apply_peer_filter(peer_filter const& filter
++		, torrent_state* state, std::vector<address>& banned)
++	{
++		TORRENT_ASSERT(is_single_thread());
++		INVARIANT_CHECK;
++
++		for (iterator i = m_peers.begin(); i != m_peers.end();)
++		{
++			if ((*i)->connection == nullptr)
++			{
++				++i;
++				continue;
++			}
++			peer_connection_interface* p = (*i)->connection;
++			peer_id const& pid = p->pid();
++			address const remote_addr = p->remote().address();
++			// evaluate both the client name derived from the peer-id and
++			// the client version advertised in the BEP 10 extended
++			// handshake ("v" field), which may be more truthful for
++			// clients that spoof their peer-id
++			std::string const& client_version = p->client_version();
++			bool const blocked = filter.peer_blocked(pid
++					, aux::identify_client_impl(pid), remote_addr)
++				|| (!client_version.empty()
++					&& filter.peer_blocked(pid, client_version, remote_addr));
++			if (!blocked)
++			{
++				++i;
++				continue;
++			}
++			if (*i == m_locked_peer)
++			{
++				++i;
++				continue;
++			}
++
++			int const current = int(i - m_peers.begin());
++			TORRENT_ASSERT(current >= 0);
++			TORRENT_ASSERT(m_peers.size() > 0);
++			TORRENT_ASSERT(i != m_peers.end());
++
++			// disconnecting the peer here may also delete the
++			// peer_info_struct. If that is the case, just continue
++			int count = int(m_peers.size());
++
++			banned.push_back(remote_addr);
++
++			p->disconnect(errors::banned_by_client_filter
++				, operation_t::bittorrent);
++
++			// what *i refers to has changed, i.e. cur was deleted
++			if (int(m_peers.size()) < count)
++			{
++				i = m_peers.begin() + current;
++				continue;
++			}
++			TORRENT_ASSERT((*i)->connection == nullptr
++				|| (*i)->connection->peer_info_struct() == nullptr);
++
++			erase_peer(i, state);
++			i = m_peers.begin() + current;
++		}
++	}
++
+ 	void peer_list::erase_peer(torrent_peer* p, torrent_state* state)
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+@@ -612,7 +685,8 @@ namespace libtorrent {
+ 		torrent_peer* i = nullptr;
+ 
+ 		bool found = false;
+-		if (state->allow_multiple_connections_per_ip)
++		if (state->allow_multiple_connections_per_ip
++			&& is_internal_address(c.remote().address()))
+ 		{
+ 			auto const& remote = c.remote();
+ 			auto const addr = remote.address();
+@@ -816,7 +890,8 @@ namespace libtorrent {
+ 
+ 		if (p->port == port) return true;
+ 
+-		if (state->allow_multiple_connections_per_ip)
++		if (state->allow_multiple_connections_per_ip
++			&& is_internal_address(p->address()))
+ 		{
+ 			auto const addr = p->address();
+ 			auto const range = find_peers(addr);
+@@ -1068,7 +1143,8 @@ namespace libtorrent {
+ 		torrent_peer* p = nullptr;
+ 
+ 		bool found = false;
+-		if (state->allow_multiple_connections_per_ip)
++		if (state->allow_multiple_connections_per_ip
++			&& is_internal_address(remote_address))
+ 		{
+ 			auto const range = find_peers(remote_address);
+ 			iter = std::find_if(range.first, range.second
+@@ -1235,6 +1311,7 @@ namespace libtorrent {
+ 		// to avoid adding one entry for every single connection
+ 		// the peer makes to us, don't save this entry
+ 		if (state->allow_multiple_connections_per_ip
++			&& is_internal_address(p->address())
+ 			&& !p->connectable
+ 			&& p != m_locked_peer)
+ 		{
+diff --git a/src/session_handle.cpp b/src/session_handle.cpp
+index d946f4f..403da3e 100644
+--- a/src/session_handle.cpp
++++ b/src/session_handle.cpp
+@@ -848,6 +848,17 @@ namespace {
+ 		async_call(&session_impl::set_port_filter, f);
+ 	}
+ 
++	void session_handle::set_peer_filter(peer_filter const& f)
++	{
++		std::shared_ptr<peer_filter> copy = std::make_shared<peer_filter>(f);
++		async_call(&session_impl::set_peer_filter, copy);
++	}
++
++	peer_filter session_handle::get_peer_filter() const
++	{
++		return sync_call_ret<peer_filter>(&session_impl::get_peer_filter);
++	}
++
+ #if TORRENT_ABI_VERSION == 1
+ 	void session_handle::set_peer_id(peer_id const& id)
+ 	{
+diff --git a/src/session_impl.cpp b/src/session_impl.cpp
+index 1704d7d..8035f96 100644
+--- a/src/session_impl.cpp
++++ b/src/session_impl.cpp
+@@ -63,6 +63,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/bt_peer_connection.hpp"
+ #include "libtorrent/peer_connection_handle.hpp"
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/socket.hpp"
+ #include "libtorrent/aux_/session_impl.hpp"
+ #ifndef TORRENT_DISABLE_DHT
+@@ -530,6 +531,27 @@ namespace aux {
+ 		, m_close_file_timer(m_io_service)
+ 		, m_paused(flags & session::paused)
+ 	{
++		m_temp_ban_time = aux::monotonic_time_now();
++
++		// if a rules.txt file is present in the process' current working
++		// directory, load it as the initial peer filter
++		error_code ec;
++		peer_filter pf;
++		if (load_peer_filter_file("rules.txt", pf, ec))
++		{
++			m_peer_filter = std::make_shared<peer_filter>(std::move(pf));
++#ifndef TORRENT_DISABLE_LOGGING
++			session_log("loaded peer filter from rules.txt");
++#endif
++		}
++		else if (ec && ec != boost::system::errc::no_such_file_or_directory
++			&& m_alerts.should_post<session_error_alert>())
++		{
++			// only unexpected failures are reported; a missing file
++			// simply means no initial peer filter
++			m_alerts.emplace_alert<session_error_alert>(ec
++				, "failed to load peer filter rules.txt");
++		}
+ 	}
+ 
+ 	template <typename Fun, typename... Args>
+@@ -963,6 +985,7 @@ namespace aux {
+ 
+ 		// abort the main thread
+ 		m_abort = true;
++		m_pending_temp_ban_disconnects.clear();
+ 		error_code ec;
+ 
+ #if TORRENT_USE_I2P
+@@ -1079,7 +1102,23 @@ namespace aux {
+ 		// removing a peer may not throw an exception, so prepare for this
+ 		// connection to be added to the undead peers now.
+ 		m_undead_peers.reserve(m_undead_peers.size() + m_connections.size() + 1);
+-		m_connections.insert(c);
++		auto const inserted = m_connections.insert(c);
++		if (!inserted.second) return;
++		auto rollback_connection = aux::scope_end([&] { m_connections.erase(inserted.first); });
++		address const remote = c->remote().address();
++		address const norm = remote.is_v6() && remote.to_v6().is_v4_mapped()
++			? address(remote.to_v6().to_v4()) : remote;
++		auto const entry = m_connection_addresses.emplace(c.get(), norm);
++		auto rollback_address = aux::scope_end([&] { m_connection_addresses.erase(entry.first); });
++		auto const bucket = m_connections_by_ip.emplace(norm, std::unordered_set<peer_connection*>{});
++		auto rollback_bucket = aux::scope_end([&]
++		{
++			if (bucket.second) m_connections_by_ip.erase(bucket.first);
++		});
++		bucket.first->second.insert(c.get());
++		rollback_bucket.disarm();
++		rollback_address.disarm();
++		rollback_connection.disarm();
+ 
+ 		TORRENT_ASSERT_VAL(m_undead_peers.capacity() >= m_connections.size()
+ 			, m_undead_peers.capacity());
+@@ -1108,6 +1147,18 @@ namespace aux {
+ 			i.second->set_ip_filter(m_ip_filter);
+ 	}
+ 
++	void session_impl::set_peer_filter(std::shared_ptr<peer_filter> const& f)
++	{
++		INVARIANT_CHECK;
++
++		m_peer_filter = f;
++
++		// Close connections whose peer-id, client name or endpoint
++		// is filtered by the new peer-filter
++		for (auto& i : m_torrents)
++			i.second->set_peer_filter(m_peer_filter);
++	}
++
+ 	void session_impl::ban_ip(address addr)
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+@@ -1117,6 +1168,95 @@ namespace aux {
+ 			i.second->set_ip_filter(m_ip_filter);
+ 	}
+ 
++	void session_impl::ban_ip_temp(address addr)
++	{
++		ban_ip_temp_at(addr, m_temp_ban_time);
++	}
++
++	void session_impl::ban_ip_temp_at(address addr, monotonic_time_point const now)
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (is_internal_address(addr)) return;
++		address const norm = addr.is_v6() && addr.to_v6().is_v4_mapped()
++			? address(addr.to_v6().to_v4()) : addr;
++		monotonic_time_point const expiry = now + m_temp_ban_duration;
++
++		if (!m_abort && m_connections_by_ip.find(norm) != m_connections_by_ip.end())
++		{
++			auto const pending = m_pending_temp_ban_disconnects.insert(norm);
++			auto rollback_pending = aux::scope_end([&]
++			{
++				if (pending.second) m_pending_temp_ban_disconnects.erase(pending.first);
++			});
++			if (!m_temp_ban_disconnect_posted)
++			{
++				m_io_service.post([this]
++				{
++					auto reset_posted = aux::scope_end([&] { m_temp_ban_disconnect_posted = false; });
++					while (!m_pending_temp_ban_disconnects.empty())
++					{
++						address const ip = *m_pending_temp_ban_disconnects.begin();
++						m_pending_temp_ban_disconnects.erase(m_pending_temp_ban_disconnects.begin());
++						this->wrap(&session_impl::disconnect_temp_banned_ip, ip);
++					}
++				});
++				m_temp_ban_disconnect_posted = true;
++			}
++			rollback_pending.disarm();
++		}
++
++		auto& by_addr = m_temp_ban.get<0>();
++		auto& by_seq = m_temp_ban.get<1>();
++
++		while (!by_seq.empty() && by_seq.front().expiry <= now)
++			by_seq.pop_front();
++
++		if (by_addr.find(norm) != by_addr.end()) return;
++
++		if (by_seq.size() >= m_temp_ban_max_size) return;
++
++		by_seq.push_back(temp_ban_entry{norm, expiry});
++	}
++
++	void session_impl::disconnect_temp_banned_ip(address const addr)
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (m_abort) return;
++		auto const bucket = m_connections_by_ip.find(addr);
++		if (bucket == m_connections_by_ip.end()) return;
++		std::vector<std::shared_ptr<peer_connection>> peers;
++		peers.reserve(bucket->second.size());
++		for (auto const p : bucket->second)
++			peers.push_back(p->self());
++		for (auto const& p : peers)
++		{
++			if (p->type() != connection_type::bittorrent || p->is_disconnecting()) continue;
++			if (m_alerts.should_post<peer_blocked_alert>())
++			{
++				auto const t = p->associated_torrent().lock();
++				m_alerts.emplace_alert<peer_blocked_alert>(t ? t->get_handle() : torrent_handle()
++					, p->remote(), peer_blocked_alert::peer_filter);
++			}
++			p->disconnect(errors::banned_by_client_filter, operation_t::bittorrent);
++		}
++	}
++
++	bool session_impl::is_temp_banned(address const& addr)
++	{
++		return is_temp_banned_at(addr, m_temp_ban_time);
++	}
++
++	bool session_impl::is_temp_banned_at(address const& addr, monotonic_time_point const now) const
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (is_internal_address(addr)) return false;
++		address const norm = addr.is_v6() && addr.to_v6().is_v4_mapped()
++			? address(addr.to_v6().to_v4()) : addr;
++		auto const& by_addr = m_temp_ban.get<0>();
++		auto const it = by_addr.find(norm);
++		return it != by_addr.end() && now < it->expiry;
++	}
++
+ 	ip_filter const& session_impl::get_ip_filter()
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+@@ -1124,6 +1264,13 @@ namespace aux {
+ 		return *m_ip_filter;
+ 	}
+ 
++	peer_filter const& session_impl::get_peer_filter()
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (!m_peer_filter) m_peer_filter = std::make_shared<peer_filter>();
++		return *m_peer_filter;
++	}
++
+ 	port_filter const& session_impl::get_port_filter() const
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+@@ -1422,9 +1569,6 @@ namespace {
+ 			|| (pack.has_val(settings_pack::proxy_type)
+ 				&& pack.get_int(settings_pack::proxy_type)
+ 					!= m_settings.get_int(settings_pack::proxy_type))
+-			|| (pack.has_val(settings_pack::proxy_peer_connections)
+-				&& pack.get_bool(settings_pack::proxy_peer_connections)
+-					!= m_settings.get_bool(settings_pack::proxy_peer_connections))
+ 			;
+ 
+ #ifndef TORRENT_DISABLE_LOGGING
+@@ -1899,24 +2043,8 @@ namespace {
+ 		// of a new socket failing to bind due to a conflict with a stale socket
+ 		std::vector<listen_endpoint_t> eps;
+ 
+-		// if we don't proxy peer connections, don't apply the special logic for
+-		// proxies
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-		{
+-			// we will be able to accept incoming connections over UDP. so use
+-			// one of the ports the user specified to use a consistent port
+-			// across sessions. If the user did not specify any ports, pick one
+-			// at random
+-			int const port = m_listen_interfaces.empty()
+-				? int(random(63000) + 2000)
+-				: m_listen_interfaces.front().port;
+-			listen_endpoint_t ep(address_v4::any(), port, {}
+-				, transport::plaintext, listen_socket_t::proxy);
+-			eps.emplace_back(ep);
+-		}
+-		else
+ 		{
++
+ 			std::vector<ip_interface> const ifs = enum_net_interfaces(m_io_service, ec);
+ 			if (ec && m_alerts.should_post<listen_failed_alert>())
+ 			{
+@@ -2676,12 +2804,6 @@ namespace {
+ 		}
+ 		async_accept(listener, ssl);
+ 
+-		// don't accept any connections from our local sockets if we're using a
+-		// proxy
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-			return;
+-
+ 		auto listen = std::find_if(m_listen_sockets.begin(), m_listen_sockets.end()
+ 			, [&listener](std::shared_ptr<listen_socket_t> const& l)
+ 		{ return l->sock == listener; });
+@@ -2882,6 +3004,18 @@ namespace {
+ 		if (!is_local(endp.address()))
+ 			m_stats_counters.set_value(counters::has_incoming_connections, 1);
+ 
++		if (is_temp_banned(endp.address()))
++		{
++#ifndef TORRENT_DISABLE_LOGGING
++			session_log("<== INCOMING CONNECTION [ temporarily banned ip: %s ]"
++				, print_endpoint(endp).c_str());
++#endif
++			if (m_alerts.should_post<peer_blocked_alert>())
++				m_alerts.emplace_alert<peer_blocked_alert>(torrent_handle()
++					, endp, peer_blocked_alert::ip_filter);
++			return;
++		}
++
+ 		// this filter is ignored if a single torrent
+ 		// is set to ignore the filter, since this peer might be
+ 		// for that torrent
+@@ -2997,11 +3131,7 @@ namespace {
+ 			if (num_connections() >= limit)
+ 				c->peer_exceeds_limit();
+ 
+-			TORRENT_ASSERT(!c->m_in_constructor);
+-			// removing a peer may not throw an exception, so prepare for this
+-			// connection to be added to the undead peers now.
+-			m_undead_peers.reserve(m_undead_peers.size() + m_connections.size() + 1);
+-			m_connections.insert(c);
++			insert_peer(c);
+ 			c->start();
+ 		}
+ 	}
+@@ -3017,6 +3147,26 @@ namespace {
+ 		// make sure the next disk peer round-robin cursor stays valid
+ 		if (i != m_connections.end())
+ 		{
++			auto const entry = m_connection_addresses.find(p);
++			TORRENT_ASSERT(entry != m_connection_addresses.end());
++			if (entry != m_connection_addresses.end())
++			{
++				address const addr = entry->second;
++				address const norm = addr.is_v6() && addr.to_v6().is_v4_mapped()
++					? address(addr.to_v6().to_v4()) : addr;
++				auto const bucket = m_connections_by_ip.find(norm);
++				TORRENT_ASSERT(bucket != m_connections_by_ip.end());
++				if (bucket != m_connections_by_ip.end())
++				{
++					bucket->second.erase(p);
++					if (bucket->second.empty())
++					{
++						m_pending_temp_ban_disconnects.erase(norm);
++						m_connections_by_ip.erase(bucket);
++					}
++				}
++				m_connection_addresses.erase(entry);
++			}
+ 			m_connections.erase(i);
+ 
+ 			TORRENT_ASSERT(std::find(m_undead_peers.begin()
+@@ -3197,6 +3347,7 @@ namespace {
+ 		deferred_submit_jobs();
+ 
+ 		time_point const now = aux::time_now();
++		m_temp_ban_time = aux::monotonic_time_now();
+ 
+ 		// remove undead peers that only have this list as their reference keeping them alive
+ 		if (!m_undead_peers.empty())
+@@ -4843,6 +4994,7 @@ namespace {
+ 		}
+ 
+ 		torrent_ptr->set_ip_filter(m_ip_filter);
++		torrent_ptr->set_peer_filter(m_peer_filter);
+ 		torrent_ptr->start();
+ 
+ #ifndef TORRENT_DISABLE_EXTENSIONS
+@@ -5536,10 +5688,6 @@ namespace {
+ 			return std::uint16_t(sock->tcp_external_port());
+ 		}
+ 
+-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
+-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
+-			return 0;
+-
+ 		for (auto const& s : m_listen_sockets)
+ 		{
+ 			if (!(s->flags & listen_socket_t::accept_incoming)) continue;
+@@ -6222,6 +6370,9 @@ namespace {
+ // TODO: asserts that no outstanding async operations are still in flight
+ 
+ 		// this can happen if we end the io_service run loop with an exception
++		m_pending_temp_ban_disconnects.clear();
++		m_connections_by_ip.clear();
++		m_connection_addresses.clear();
+ 		m_connections.clear();
+ 		for (auto& t : m_torrents)
+ 		{
+@@ -7192,6 +7343,17 @@ namespace {
+ 		TORRENT_ASSERT(num_active_downloading == int(m_torrent_lists[torrent_want_peers_download].size()));
+ 		TORRENT_ASSERT(num_active_finished == int(m_torrent_lists[torrent_want_peers_finished].size()));
+ 
++		TORRENT_ASSERT(m_connection_addresses.size() == m_connections.size());
++		std::size_t indexed_peers = 0;
++		for (auto const& bucket : m_connections_by_ip)
++		{
++			TORRENT_ASSERT(!bucket.second.empty());
++			indexed_peers += bucket.second.size();
++		}
++		TORRENT_ASSERT(indexed_peers == m_connections.size());
++		for (auto const& addr : m_pending_temp_ban_disconnects)
++			TORRENT_ASSERT(m_connections_by_ip.count(addr) == 1);
++
+ 		std::unordered_set<peer_connection*> unique_peers;
+ 
+ 		int unchokes = 0;
+@@ -7201,6 +7363,15 @@ namespace {
+ 		for (auto const& p : m_connections)
+ 		{
+ 			TORRENT_ASSERT(p);
++			auto const entry = m_connection_addresses.find(p.get());
++			TORRENT_ASSERT(entry != m_connection_addresses.end());
++			if (entry != m_connection_addresses.end())
++			{
++				auto const bucket = m_connections_by_ip.find(entry->second);
++				TORRENT_ASSERT(bucket != m_connections_by_ip.end());
++				if (bucket != m_connections_by_ip.end())
++					TORRENT_ASSERT(bucket->second.count(p.get()) == 1);
++			}
+ 			if (p->is_disconnecting()) continue;
+ 
+ 			std::shared_ptr<torrent> t = p->associated_torrent().lock();
+diff --git a/src/time.cpp b/src/time.cpp
+index 04c8072..e71c2d0 100644
+--- a/src/time.cpp
++++ b/src/time.cpp
+@@ -38,6 +38,7 @@ namespace libtorrent { namespace aux {
+ 
+ 	time_point time_now() { return clock_type::now(); }
+ 	time_point32 time_now32() { return time_point_cast<seconds32>(clock_type::now()); }
++	monotonic_time_point monotonic_time_now() { return monotonic_clock::now(); }
+ 
+ 	// for simplying implementation
+ 	using std::chrono::system_clock;
+diff --git a/src/torrent.cpp b/src/torrent.cpp
+index a01018b..daefce7 100644
+--- a/src/torrent.cpp
++++ b/src/torrent.cpp
+@@ -82,6 +82,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/peer_class.hpp" // for peer_class
+ #include "libtorrent/socket_io.hpp" // for read_*_endpoint
+ #include "libtorrent/ip_filter.hpp"
++#include "libtorrent/peer_filter.hpp"
+ #include "libtorrent/request_blocks.hpp"
+ #include "libtorrent/performance_counters.hpp" // for counters
+ #include "libtorrent/resolver_interface.hpp"
+@@ -778,6 +779,7 @@ bool is_downloading_state(int const st)
+ 
+ 		m_apply_ip_filter = b;
+ 		ip_filter_updated();
++		peer_filter_updated();
+ 		state_updated();
+ 	}
+ 
+@@ -788,6 +790,13 @@ bool is_downloading_state(int const st)
+ 		ip_filter_updated();
+ 	}
+ 
++	void torrent::set_peer_filter(std::shared_ptr<const peer_filter> f)
++	{
++		m_peer_filter = std::move(f);
++		if (!m_apply_ip_filter) return;
++		peer_filter_updated();
++	}
++
+ #ifndef TORRENT_DISABLE_DHT
+ 	bool torrent::should_announce_dht() const
+ 	{
+@@ -6856,12 +6865,13 @@ bool is_downloading_state(int const st)
+ 
+ 		peerinfo->last_connected = m_ses.session_time();
+ #if TORRENT_USE_ASSERTS
+-		if (!settings().get_bool(settings_pack::allow_multiple_connections_per_ip))
++		if (!settings().get_bool(settings_pack::allow_multiple_connections_per_ip)
++			|| !is_internal_address(peerinfo->address()))
+ 		{
+ 			// this asserts that we don't have duplicates in the peer_list's peer list
+ 			peer_iterator i_ = std::find_if(m_connections.begin(), m_connections.end()
+ 				, [peerinfo] (peer_connection const* p)
+-				{ return !p->is_disconnecting() && p->remote() == peerinfo->ip(); });
++				{ return !p->is_disconnecting() && p->remote().address() == peerinfo->address(); });
+ #if TORRENT_USE_I2P
+ 			TORRENT_ASSERT(i_ == m_connections.end()
+ 				|| (*i_)->type() != connection_type::bittorrent
+@@ -6878,6 +6888,7 @@ bool is_downloading_state(int const st)
+ 			< settings().get_int(settings_pack::connections_limit) || ignore_limit);
+ 
+ 		tcp::endpoint a(peerinfo->ip());
++		if (m_ses.is_temp_banned(a.address())) return false;
+ 		TORRENT_ASSERT(!m_apply_ip_filter
+ 			|| !m_ip_filter
+ 			|| (m_ip_filter->access(peerinfo->address()) & ip_filter::blocked) == 0);
+@@ -10644,6 +10655,32 @@ bool is_downloading_state(int const st)
+ 		peers_erased(st.erased);
+ 	}
+ 
++	void torrent::peer_filter_updated()
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (!m_apply_ip_filter) return;
++		if (!m_peer_list) return;
++		if (!m_peer_filter) return;
++		if (m_peer_filter->empty()) return;
++
++		torrent_state st = get_peer_list_state();
++		std::vector<address> banned;
++		m_peer_list->apply_peer_filter(*m_peer_filter, &st, banned);
++
++		for (auto const& addr : banned)
++			if (!is_internal_address(addr)) m_ses.ban_ip_temp(addr);
++
++		if (alerts().should_post<peer_blocked_alert>())
++		{
++			for (auto const& addr : banned)
++				alerts().emplace_alert<peer_blocked_alert>(get_handle()
++					, tcp::endpoint(addr, 0)
++					, peer_blocked_alert::peer_filter);
++		}
++
++		peers_erased(st.erased);
++	}
++
+ 	// this is called when torrent_peers are removed from the peer_list
+ 	// (peer-list). It removes any references we may have to those torrent_peers,
+ 	// so we don't leave then dangling
+diff --git a/test/Jamfile b/test/Jamfile
+index 57a94f1..870803c 100644
+--- a/test/Jamfile
++++ b/test/Jamfile
+@@ -124,6 +124,7 @@ run test_sliding_average.cpp ;
+ run test_socket_io.cpp ;
+ run test_part_file.cpp ;
+ run test_peer_list.cpp ;
++run test_peer_filter_cache.cpp ;
+ run test_torrent_info.cpp ;
+ run test_time.cpp ;
+ run test_file_storage.cpp ;
+diff --git a/test/test_peer_filter_cache.cpp b/test/test_peer_filter_cache.cpp
+new file mode 100644
+index 0000000..c79ca01
+--- /dev/null
++++ b/test/test_peer_filter_cache.cpp
+@@ -0,0 +1,232 @@
++/*
++
++Copyright (c) 2005-2018, Arvid Norberg
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions
++are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the distribution.
++    * Neither the name of the author nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++*/
++
++#include "libtorrent/peer_filter.hpp"
++#include "libtorrent/peer_id.hpp"
++#include "libtorrent/address.hpp"
++
++#include "test.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace lt;
++
++namespace {
++
++sha1_hash make_pid(std::string const& s)
++{
++	char buf[20] = {};
++	std::memcpy(buf, s.data(), s.size() > 20 ? 20 : s.size());
++	sha1_hash pid;
++	pid.assign(buf);
++	return pid;
++}
++
++address const test_addr = address::from_string("90.0.0.1");
++
++std::string long_client_string()
++{
++	std::string ret(1025, 'x');
++	ret.replace(1015, 10, "XunleiXunl");
++	return ret;
++}
++
++} // anonymous namespace
++
++TORRENT_TEST(peer_filter_cache_peer_id_prefix)
++{
++	peer_filter f;
++	f.add_peer_id("-XL0012-");
++	TEST_EQUAL(f.peer_blocked(make_pid("-XL0012-wxyz"), "", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-DE1234-wxyz"), "", test_addr), false);
++}
++
++TORRENT_TEST(peer_filter_cache_binary_nul_peer_ids)
++{
++	peer_filter f;
++	f.add_peer_id(std::string("-AB\0", 4));
++	TEST_EQUAL(f.peer_blocked(make_pid(std::string("-AB\0xxxxxxxxxxxxxxxx", 20))
++		, "", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid(std::string("-AB\0yyyyyyyyyyyyyyyy", 20))
++		, "", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid(std::string("-AC\0zzzzzzzzzzzzzzzz", 20))
++		, "", test_addr), false);
++}
++
++TORRENT_TEST(peer_filter_cache_substring_ci)
++{
++	peer_filter f;
++	f.add_client("Xunlei");
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "Thunder Xunlei 7.9", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "xunlei mobile", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "qBittorrent 4.6", test_addr), false);
++}
++
++TORRENT_TEST(peer_filter_cache_negative_regex_cached)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_peer_id_regex("-XX[0-9]{4}-", ec);
++	TEST_CHECK(!ec);
++	sha1_hash const pid = make_pid("-YY0000-");
++	TEST_EQUAL(f.peer_blocked(pid, "", test_addr), false);
++	TEST_EQUAL(f.peer_blocked(pid, "", test_addr), false);
++	f.add_peer_id("-YY");
++	TEST_EQUAL(f.peer_blocked(pid, "", test_addr), true);
++}
++
++TORRENT_TEST(peer_filter_cache_copy_semantics)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_client_regex("[Xx]unlei", ec);
++	TEST_CHECK(!ec);
++	peer_filter copy = f;
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "Xunlei", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "transmission", test_addr), false);
++	copy.add_peer_id("-ZZ");
++	TEST_EQUAL(f.peer_blocked(make_pid("-ZZ1234-"), "transmission", test_addr), false);
++	TEST_EQUAL(copy.peer_blocked(make_pid("-ZZ1234-"), "transmission", test_addr), true);
++	TEST_EQUAL(copy.peer_blocked(make_pid("-AB1234-"), "Xunlei", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "Xunlei", test_addr), true);
++}
++
++TORRENT_TEST(peer_filter_cache_multiple_peer_id_regexes)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_peer_id_regex("-XX[0-9]{4}-", ec);
++	f.add_peer_id_regex("-YY[0-9]{4}-", ec);
++	TEST_CHECK(!ec);
++	TEST_EQUAL(f.peer_blocked(make_pid("-YY0000-"), "", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-YY0000-"), "", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-ZZ0000-"), "", test_addr), false);
++	TEST_EQUAL(f.peer_blocked(make_pid("-ZZ0000-"), "", test_addr), false);
++}
++
++TORRENT_TEST(peer_filter_cache_client_rule_invalidation)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_client_regex("Xunlei", ec);
++	TEST_CHECK(!ec);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "no match here", test_addr), false);
++	f.add_client("no match");
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "no match here", test_addr), true);
++	f.clear();
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "no match here", test_addr), false);
++}
++
++TORRENT_TEST(peer_filter_cache_regex_case_sensitive)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_client_regex("[Xx]unlei", ec);
++	TEST_CHECK(!ec);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "XUNLEI", test_addr), false);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "xunlei", test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), "Xunlei", test_addr), true);
++}
++
++TORRENT_TEST(peer_filter_cache_long_client_not_cached)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_client_regex("Xunlei", ec);
++	TEST_CHECK(!ec);
++	std::string const long_client = long_client_string();
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), long_client, test_addr), true);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), long_client, test_addr), true);
++	std::string const long_neg = std::string(1025, 'q');
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), long_neg, test_addr), false);
++	TEST_EQUAL(f.peer_blocked(make_pid("-AB1234-"), long_neg, test_addr), false);
++}
++
++TORRENT_TEST(peer_filter_cache_ip_not_cached)
++{
++	peer_filter f;
++	f.add_rule(address::from_string("90.0.0.0"), address::from_string("90.0.0.255")
++		, ip_filter::blocked);
++	sha1_hash const pid = make_pid("-AB1234-");
++	TEST_EQUAL(f.peer_blocked(pid, "", address::from_string("90.0.0.7")), true);
++	TEST_EQUAL(f.peer_blocked(pid, "", address::from_string("91.0.0.7")), false);
++	TEST_EQUAL(f.peer_blocked(pid, "", address::from_string("90.0.0.7")), true);
++}
++
++TORRENT_TEST(peer_filter_cache_invalid_regex_no_rule)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_client_regex("[invalid", ec);
++	TEST_CHECK(ec);
++	TEST_CHECK(!f.peer_blocked(make_pid("-AB1234-"), "Xunlei", test_addr));
++	error_code ec2;
++	f.add_peer_id_regex("(?P<", ec2);
++	TEST_CHECK(ec2);
++	TEST_CHECK(!f.peer_blocked(make_pid("-AB1234-"), "", test_addr));
++}
++
++TORRENT_TEST(peer_filter_cache_concurrent_const)
++{
++	peer_filter f;
++	error_code ec;
++	f.add_client("xunlei");
++	f.add_peer_id_regex("-XX[0-9]+-", ec);
++	TEST_CHECK(!ec);
++	f.add_client_regex("[Xx]unlei", ec);
++	TEST_CHECK(!ec);
++	std::atomic<bool> stop(false);
++	std::vector<std::thread> threads;
++	for (int i = 0; i < 8; ++i)
++	{
++		threads.emplace_back([&f, &stop]
++		{
++			int counter = 0;
++			while (!stop.load(std::memory_order_relaxed))
++			{
++				sha1_hash const pid = make_pid(counter % 2 ? "-XX0042-" : "-QQ0042-");
++				bool const blocked = f.peer_blocked(pid, "Xunlei 7.9", test_addr);
++				TEST_CHECK(blocked);
++				bool const allowed = f.peer_blocked(make_pid("-QQ0042-"), "qBittorrent", test_addr);
++				TEST_CHECK(!allowed);
++				++counter;
++			}
++		});
++	}
++	std::this_thread::sleep_for(std::chrono::milliseconds(200));
++	stop.store(true);
++	for (auto& t : threads) t.join();
++}
+diff --git a/test/test_peer_list.cpp b/test/test_peer_list.cpp
+index 38870d2..aa4dee3 100644
+--- a/test/test_peer_list.cpp
++++ b/test/test_peer_list.cpp
+@@ -30,6 +30,13 @@ POSSIBILITY OF SUCH DAMAGE.
+ 
+ */
+ 
++#include "libtorrent/aux_/session_impl.hpp"
++#include "libtorrent/aux_/socket_type.hpp"
++#include "libtorrent/add_torrent_params.hpp"
++#include "libtorrent/bt_peer_connection.hpp"
++#include "libtorrent/torrent.hpp"
++#include "libtorrent/torrent_peer.hpp"
++#include "libtorrent/settings_pack.hpp"
+ #include "libtorrent/peer_list.hpp"
+ #include "libtorrent/torrent_handle.hpp"
+ #include "libtorrent/torrent_peer_allocator.hpp"
+@@ -47,6 +54,86 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include <memory> // for shared_ptr
+ #include <cstdarg>
+ 
++namespace libtorrent { namespace aux {
++
++struct temp_ban_test_access
++{
++	static void ban_ip_temp_at(session_impl& ses, address const& addr
++		, monotonic_time_point const now)
++	{
++		ses.ban_ip_temp_at(addr, now);
++	}
++
++	static bool is_temp_banned_at(session_impl const& ses, address const& addr
++		, monotonic_time_point const now)
++	{
++		return ses.is_temp_banned_at(addr, now);
++	}
++
++	static std::deque<std::pair<address, monotonic_time_point>> queue(session_impl const& ses)
++	{
++		std::deque<std::pair<address, monotonic_time_point>> ret;
++		for (auto const& e : ses.m_temp_ban.get<1>())
++			ret.emplace_back(e.addr, e.expiry);
++		return ret;
++	}
++
++	static std::unordered_map<address, monotonic_time_point> map(session_impl const& ses)
++	{
++		std::unordered_map<address, monotonic_time_point> ret;
++		for (auto const& e : ses.m_temp_ban.get<0>())
++			ret.emplace(e.addr, e.expiry);
++		return ret;
++	}
++
++	static void set_temp_ban_time(session_impl& ses, monotonic_time_point const now)
++	{
++		ses.m_temp_ban_time = now;
++	}
++
++	static std::size_t bucket_size(session_impl const& ses, address const& addr)
++	{
++		auto const bucket = ses.m_connections_by_ip.find(addr);
++		return bucket == ses.m_connections_by_ip.end() ? 0 : bucket->second.size();
++	}
++
++	static std::size_t bucket_count(session_impl const& ses)
++	{
++		return ses.m_connections_by_ip.size();
++	}
++
++	static std::size_t indexed_connections(session_impl const& ses)
++	{
++		return ses.m_connection_addresses.size();
++	}
++
++	static std::size_t pending_disconnects(session_impl const& ses)
++	{
++		return ses.m_pending_temp_ban_disconnects.size();
++	}
++
++	static void clear_undead(session_impl& ses)
++	{
++		ses.m_undead_peers.clear();
++	}
++
++	static void insert_peer_args(session_impl& ses, io_service& ios
++		, tcp::endpoint const& remote, peer_connection_args& args)
++	{
++		args.ses = &ses;
++		args.sett = &ses.m_settings;
++		args.stats_counters = &ses.m_stats_counters;
++		args.disk_thread = &ses.m_disk_thread;
++		args.ios = &ios;
++		args.tor = {};
++		args.endp = remote;
++		args.peerinfo = nullptr;
++		args.our_peer_id = peer_id{};
++	}
++};
++
++}}
++
+ using namespace lt;
+ 
+ namespace {
+@@ -201,6 +288,421 @@ void connect_peer(peer_list& p, mock_torrent& t, torrent_state& st)
+ 
+ static torrent_peer_allocator allocator;
+ 
++settings_pack temp_ban_settings()
++{
++	settings_pack pack;
++	pack.set_int(settings_pack::aio_threads, 0);
++	return pack;
++}
++
++using temp_ban_access = aux::temp_ban_test_access;
++
++monotonic_time_point temp_ban_base_time()
++{
++	return lt::monotonic_time_point::min() + seconds(7200);
++}
++
++struct temp_ban_session
++{
++	io_service ios;
++	aux::session_impl ses{ios, temp_ban_settings(), {}};
++};
++
++address temp_ban_address(int const index)
++{
++	return address_v4(0x08080000U + std::uint32_t(index));
++}
++
++void fill_temp_bans(aux::session_impl& ses)
++{
++	for (int i = 0; i < 65536; ++i)
++		ses.ban_ip_temp(temp_ban_address(i));
++}
++
++struct multiple_connections_case
++{
++	char const* ip;
++	bool internal;
++};
++
++multiple_connections_case const multiple_connections_cases[] = {
++	{"8.8.8.8", false},
++	{"2001:4860:4860::8888", false},
++	{"::ffff:8.8.8.8", false},
++	{"10.0.0.2", true},
++	{"172.16.0.2", true},
++	{"192.168.0.2", true},
++	{"127.0.0.2", true},
++	{"169.254.0.2", true},
++	{"::1", true},
++	{"fd00::2", true},
++	{"::ffff:10.0.0.2", true}
++};
++
++struct temp_ban_peer : bt_peer_connection
++{
++	temp_ban_peer(temp_ban_session& fixture, tcp::endpoint const& remote)
++		: bt_peer_connection(make_args(fixture, remote))
++		, session(fixture.ses)
++	{}
++
++	void disconnect(error_code const& ec
++		, operation_t const op, disconnect_severity_t const severity = normal) override
++	{
++		++disconnects;
++		TEST_CHECK(ec == (session.is_aborted()
++			? errors::stopping_torrent : errors::banned_by_client_filter));
++		TEST_CHECK(op == operation_t::bittorrent);
++		TEST_CHECK(severity == normal);
++		m_disconnecting = true;
++		session.close_connection(this);
++	}
++
++	void mark_disconnecting() { m_disconnecting = true; }
++
++	void reset_remote() { m_remote = tcp::endpoint(); }
++
++	void associate(std::shared_ptr<torrent> const& t) { m_torrent = t; }
++
++	connection_type type() const override { return protocol; }
++
++	aux::session_impl& session;
++	connection_type protocol = connection_type::bittorrent;
++	int disconnects = 0;
++
++private:
++	static peer_connection_args make_args(temp_ban_session& fixture
++		, tcp::endpoint const& remote)
++	{
++		peer_connection_args args;
++		auto s = std::make_shared<aux::socket_type>(fixture.ios);
++		s->instantiate<tcp::socket>(fixture.ios);
++		args.s = s;
++		aux::temp_ban_test_access::insert_peer_args(fixture.ses, fixture.ios
++			, remote, args);
++		return args;
++	}
++};
++
++struct temp_ban_fixture
++{
++	temp_ban_session session;
++	std::vector<std::shared_ptr<temp_ban_peer>> peers;
++
++	~temp_ban_fixture()
++	{
++		for (auto const& peer : peers)
++		{
++			peer->mark_disconnecting();
++			session.ses.close_connection(peer.get());
++		}
++		temp_ban_access::clear_undead(session.ses);
++	}
++
++	std::shared_ptr<temp_ban_peer> add_peer(char const* ip, std::uint16_t const port)
++	{
++		auto peer = std::make_shared<temp_ban_peer>(session
++			, tcp::endpoint(make_address(ip), port));
++		session.ses.insert_peer(peer);
++		peers.push_back(peer);
++		return peer;
++	}
++};
++
++TORRENT_TEST(temp_ban_disconnect_sweep)
++{
++	temp_ban_fixture fx;
++	auto const base = aux::monotonic_time_now();
++	auto& ses = fx.session.ses;
++
++	auto same1 = fx.add_peer("8.8.8.8", 4001);
++	auto same2 = fx.add_peer("8.8.8.8", 4002);
++	auto same3 = fx.add_peer("::ffff:8.8.8.8", 4003);
++	auto other = fx.add_peer("9.9.9.9", 4004);
++	auto priv = fx.add_peer("192.168.1.5", 4005);
++
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, make_address("8.8.8.8")
++		, base) == false);
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, make_address("9.9.9.9")
++		, base) == false);
++
++	temp_ban_access::ban_ip_temp_at(ses, make_address("::ffff:8.8.8.8"), base);
++
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, make_address("8.8.8.8")
++		, base));
++	TEST_CHECK(!same1->is_disconnecting() && !same2->is_disconnecting()
++		&& !same3->is_disconnecting() && !other->is_disconnecting()
++		&& !priv->is_disconnecting());
++
++	fx.session.ios.poll();
++
++	TEST_EQUAL(same1->disconnects, 1);
++	TEST_EQUAL(same2->disconnects, 1);
++	TEST_EQUAL(same3->disconnects, 1);
++	TEST_EQUAL(other->disconnects, 0);
++	TEST_EQUAL(priv->disconnects, 0);
++	TEST_CHECK(temp_ban_access::map(ses).count(make_address("8.8.8.8")) == 1);
++}
++
++TORRENT_TEST(temp_ban_connection_index_removal)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++	auto const ip = make_address("8.8.8.8");
++	auto first = fx.add_peer("8.8.8.8", 4101);
++	auto mapped = fx.add_peer("::ffff:8.8.8.8", 4102);
++	auto other = fx.add_peer("9.9.9.9", 4103);
++	ses.insert_peer(first);
++	TEST_EQUAL(ses.num_connections(), 3);
++	TEST_EQUAL(temp_ban_access::bucket_count(ses), 2);
++	TEST_EQUAL(temp_ban_access::bucket_size(ses, ip), 2);
++	TEST_EQUAL(temp_ban_access::bucket_size(ses, make_address("::ffff:8.8.8.8")), 0);
++	TEST_EQUAL(temp_ban_access::indexed_connections(ses), 3);
++
++	ses.ban_ip_temp(ip);
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 1);
++	first->mark_disconnecting();
++	ses.close_connection(first.get());
++	TEST_EQUAL(temp_ban_access::bucket_size(ses, ip), 1);
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 1);
++	mapped->mark_disconnecting();
++	mapped->reset_remote();
++	ses.close_connection(mapped.get());
++	ses.close_connection(mapped.get());
++	TEST_EQUAL(temp_ban_access::bucket_size(ses, ip), 0);
++	TEST_EQUAL(temp_ban_access::bucket_count(ses), 1);
++	TEST_EQUAL(temp_ban_access::indexed_connections(ses), 1);
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 0);
++	fx.session.ios.poll();
++	TEST_EQUAL(other->disconnects, 0);
++	TEST_EQUAL(ses.num_connections(), 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_repeated_sweep)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++	auto const ip = make_address("8.8.8.8");
++	auto first = fx.add_peer("::ffff:8.8.8.8", 4201);
++	auto other = fx.add_peer("9.9.9.9", 4202);
++	for (int i = 0; i < 100; ++i)
++	{
++		ses.ban_ip_temp(ip);
++		ses.ban_ip_temp(make_address("::ffff:8.8.8.8"));
++		ses.ban_ip_temp(make_address("1.1.1.1"));
++	}
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 1);
++	TEST_EQUAL(fx.session.ios.poll(), 1);
++	TEST_EQUAL(first->disconnects, 1);
++	TEST_EQUAL(other->disconnects, 0);
++	TEST_EQUAL(temp_ban_access::bucket_count(ses), 1);
++	TEST_EQUAL(temp_ban_access::indexed_connections(ses), 1);
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 0);
++
++	fx.session.ios.reset();
++	ses.ban_ip_temp(ip);
++	TEST_EQUAL(fx.session.ios.poll(), 0);
++	auto replacement = fx.add_peer("8.8.8.8", 4203);
++	fx.session.ios.reset();
++	ses.ban_ip_temp(ip);
++	TEST_EQUAL(fx.session.ios.poll(), 1);
++	TEST_EQUAL(first->disconnects, 1);
++	TEST_EQUAL(replacement->disconnects, 1);
++	TEST_EQUAL(other->disconnects, 0);
++	TEST_EQUAL(temp_ban_access::bucket_count(ses), 1);
++	TEST_EQUAL(temp_ban_access::indexed_connections(ses), 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_removed_peer_destroyed_before_sweep)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++	auto const ip = make_address("8.8.8.8");
++	auto removed = fx.add_peer("::ffff:8.8.8.8", 4301);
++	std::weak_ptr<temp_ban_peer> weak = removed;
++	auto remaining = fx.add_peer("8.8.8.8", 4302);
++	auto other = fx.add_peer("9.9.9.9", 4303);
++	ses.ban_ip_temp(ip);
++	removed->mark_disconnecting();
++	ses.close_connection(removed.get());
++	fx.peers.erase(fx.peers.begin());
++	temp_ban_access::clear_undead(ses);
++	removed.reset();
++	TEST_CHECK(weak.expired());
++	TEST_EQUAL(temp_ban_access::bucket_size(ses, ip), 1);
++	fx.session.ios.poll();
++	TEST_EQUAL(remaining->disconnects, 1);
++	TEST_EQUAL(other->disconnects, 0);
++	TEST_EQUAL(temp_ban_access::bucket_size(ses, ip), 0);
++}
++
++TORRENT_TEST(temp_ban_disconnect_pending_bounded_by_connections)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++	auto other = fx.add_peer("9.9.9.9", 4350);
++	for (int i = 0; i < 100; ++i)
++	{
++		auto const ip = temp_ban_address(i);
++		auto peer = std::make_shared<temp_ban_peer>(fx.session, tcp::endpoint(ip, 4351));
++		ses.insert_peer(peer);
++		ses.ban_ip_temp(ip);
++		TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 1);
++		peer->mark_disconnecting();
++		ses.close_connection(peer.get());
++		temp_ban_access::clear_undead(ses);
++		TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 0);
++	}
++	TEST_EQUAL(fx.session.ios.poll(), 1);
++	TEST_EQUAL(other->disconnects, 0);
++	TEST_EQUAL(temp_ban_access::bucket_count(ses), 1);
++	TEST_EQUAL(temp_ban_access::indexed_connections(ses), 1);
++}
++
++TORRENT_TEST(temp_ban_connection_index_abort)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++	auto first = fx.add_peer("8.8.8.8", 4401);
++	auto mapped = fx.add_peer("::ffff:8.8.8.8", 4402);
++	auto other = fx.add_peer("9.9.9.9", 4403);
++	ses.ban_ip_temp(make_address("8.8.8.8"));
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 1);
++	ses.abort();
++	TEST_EQUAL(ses.num_connections(), 0);
++	TEST_EQUAL(temp_ban_access::bucket_count(ses), 0);
++	TEST_EQUAL(temp_ban_access::indexed_connections(ses), 0);
++	TEST_EQUAL(temp_ban_access::pending_disconnects(ses), 0);
++	fx.session.ios.poll();
++	TEST_EQUAL(first->disconnects, 1);
++	TEST_EQUAL(mapped->disconnects, 1);
++	TEST_EQUAL(other->disconnects, 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_deferred_without_poll)
++{
++	temp_ban_fixture fx;
++	auto const base = aux::monotonic_time_now();
++	auto& ses = fx.session.ses;
++
++	auto a = fx.add_peer("8.8.4.4", 5001);
++	auto b = fx.add_peer("8.8.4.4", 5002);
++
++	temp_ban_access::ban_ip_temp_at(ses, make_address("8.8.4.4"), base);
++
++	TEST_EQUAL(a->disconnects, 0);
++	TEST_EQUAL(b->disconnects, 0);
++	TEST_CHECK(!a->is_disconnecting() && !b->is_disconnecting());
++}
++
++TORRENT_TEST(temp_ban_disconnect_no_connections_does_not_post)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	ses.ban_ip_temp(make_address("8.8.8.8"));
++	TEST_EQUAL(fixture.ios.poll(), 0);
++	TEST_CHECK(aux::temp_ban_test_access::map(ses).count(make_address("8.8.8.8")) == 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_sweep_after_full_cache)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++	fill_temp_bans(ses);
++	TEST_EQUAL(fx.session.ios.poll(), 0);
++	fx.session.ios.reset();
++	auto const queue = temp_ban_access::queue(ses);
++	auto const map = temp_ban_access::map(ses);
++	auto banned = fx.add_peer("9.9.9.9", 6001);
++	auto fresh = fx.add_peer("8.8.4.4", 6002);
++	auto mapped = fx.add_peer("::ffff:9.9.9.9", 6003);
++
++	ses.ban_ip_temp(make_address("9.9.9.9"));
++	TEST_CHECK(!ses.is_temp_banned(make_address("9.9.9.9")));
++	TEST_CHECK(temp_ban_access::queue(ses) == queue);
++	TEST_CHECK(temp_ban_access::map(ses) == map);
++	TEST_EQUAL(mapped->disconnects, 0);
++
++	TEST_EQUAL(banned->disconnects, 0);
++	TEST_EQUAL(fresh->disconnects, 0);
++
++	fx.session.ios.poll();
++
++	TEST_EQUAL(banned->disconnects, 1);
++	TEST_EQUAL(mapped->disconnects, 1);
++	TEST_EQUAL(fresh->disconnects, 0);
++	TEST_CHECK(temp_ban_access::queue(ses) == queue);
++	TEST_CHECK(temp_ban_access::map(ses) == map);
++	TEST_EQUAL(ses.num_connections(), 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_multiple_torrents_independent)
++{
++	temp_ban_fixture fx;
++	auto& ses = fx.session.ses;
++
++	auto a = fx.add_peer("8.8.8.8", 7001);
++	auto b = fx.add_peer("::ffff:8.8.8.8", 7002);
++	auto c = fx.add_peer("8.8.8.8", 7003);
++	add_torrent_params params;
++	params.save_path = ".";
++	params.info_hash = sha1_hash("11111111111111111111");
++	auto first = std::make_shared<torrent>(ses, true, params);
++	params.info_hash = sha1_hash("22222222222222222222");
++	auto second = std::make_shared<torrent>(ses, true, params);
++	a->associate(first);
++	b->associate(second);
++	TEST_CHECK(a->associated_torrent().lock() == first);
++	TEST_CHECK(b->associated_torrent().lock() == second);
++	TEST_CHECK(c->associated_torrent().expired());
++	TEST_CHECK(c->in_handshake());
++
++	ses.ban_ip_temp(make_address("8.8.8.8"));
++	TEST_EQUAL(a->disconnects, 0);
++	TEST_EQUAL(b->disconnects, 0);
++	TEST_EQUAL(c->disconnects, 0);
++	fx.session.ios.poll();
++
++	TEST_EQUAL(a->disconnects, 1);
++	TEST_EQUAL(b->disconnects, 1);
++	TEST_EQUAL(c->disconnects, 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_skips_disconnecting_peer)
++{
++	temp_ban_fixture fx;
++	auto const base = aux::monotonic_time_now();
++	auto& ses = fx.session.ses;
++
++	auto keep = fx.add_peer("8.8.8.8", 8001);
++	auto gone = fx.add_peer("8.8.8.8", 8002);
++	gone->mark_disconnecting();
++
++	temp_ban_access::ban_ip_temp_at(ses, make_address("8.8.8.8"), base);
++	fx.session.ios.poll();
++
++	TEST_EQUAL(gone->disconnects, 0);
++	TEST_EQUAL(keep->disconnects, 1);
++}
++
++TORRENT_TEST(temp_ban_disconnect_v6_mapped_and_public_only)
++{
++	temp_ban_fixture fx;
++	auto const base = aux::monotonic_time_now();
++	auto& ses = fx.session.ses;
++
++	auto mapped = fx.add_peer("::ffff:9.9.9.9", 9001);
++	auto v6 = fx.add_peer("2001:db8::1", 9002);
++	auto v4 = fx.add_peer("1.2.3.4", 9003);
++
++	temp_ban_access::ban_ip_temp_at(ses, make_address("::ffff:9.9.9.9"), base);
++	fx.session.ios.poll();
++
++	TEST_EQUAL(mapped->disconnects, 1);
++	TEST_EQUAL(v6->disconnects, 0);
++	TEST_EQUAL(v4->disconnects, 0);
++}
++
+ } // anonymous namespace
+ 
+ // test multiple peers with the same IP
+@@ -315,11 +817,60 @@ TORRENT_TEST(multiple_ips_disallowed2)
+ 	torrent_peer* peer2 = p.add_peer(ep("10.0.0.2", 9020), {}, {}, &st);
+ 	TEST_EQUAL(p.num_peers(), 1);
+ 	TEST_EQUAL(peer2->port, 9020);
+-		TEST_CHECK(peer1 == peer2);
++	TEST_CHECK(peer1 == peer2);
+ 	TEST_EQUAL(p.num_connect_candidates(), 0);
+ 	st.erased.clear();
+ }
+ 
++// with allow_multiple_connections_per_ip enabled, only internal addresses
++// are allowed multiple entries, public IPs are still deduplicated
++TORRENT_TEST(multiple_ips_allowed_public_dedup)
++{
++	for (auto const& c : multiple_connections_cases)
++	{
++		if (c.internal) continue;
++		torrent_state st = init_state();
++		mock_torrent t(&st);
++		st.allow_multiple_connections_per_ip = true;
++		peer_list p(allocator);
++		t.m_p = &p;
++		address const a = make_address(c.ip);
++		torrent_peer* peer1 = p.add_peer({a, 3000}, {}, {}, &st);
++		TEST_CHECK(peer1);
++		TEST_EQUAL(p.num_peers(), 1);
++
++		torrent_peer* peer2 = p.add_peer({a, 9020}, {}, {}, &st);
++		TEST_EQUAL(p.num_peers(), 1);
++		TEST_CHECK(peer1 == peer2);
++		TEST_EQUAL(peer2->port, 9020);
++		st.erased.clear();
++	}
++}
++
++// with allow_multiple_connections_per_ip enabled, internal addresses
++// are allowed multiple entries
++TORRENT_TEST(multiple_ips_allowed_internal_multi)
++{
++	for (auto const& c : multiple_connections_cases)
++	{
++		if (!c.internal) continue;
++		torrent_state st = init_state();
++		mock_torrent t(&st);
++		st.allow_multiple_connections_per_ip = true;
++		peer_list p(allocator);
++		t.m_p = &p;
++		address const a = make_address(c.ip);
++		torrent_peer* peer1 = p.add_peer({a, 3000}, {}, {}, &st);
++		TEST_CHECK(peer1);
++		TEST_EQUAL(p.num_peers(), 1);
++
++		torrent_peer* peer2 = p.add_peer({a, 9020}, {}, {}, &st);
++		TEST_EQUAL(p.num_peers(), 2);
++		TEST_CHECK(peer1 != peer2);
++		st.erased.clear();
++	}
++}
++
+ // test incoming connection
+ // and update_peer_port
+ TORRENT_TEST(update_peer_port)
+@@ -964,6 +1515,272 @@ TORRENT_TEST(new_peer_size_limit)
+ 		, 5);
+ }
+ 
++TORRENT_TEST(temp_ban_internal_and_session_scope)
++{
++	temp_ban_session fixture;
++	temp_ban_session other;
++	aux::session_interface& first = fixture.ses;
++	aux::session_interface& second = fixture.ses;
++
++	for (auto const& c : multiple_connections_cases)
++		TEST_CHECK(!second.is_temp_banned(make_address(c.ip)));
++
++	for (auto const& c : multiple_connections_cases)
++	{
++		address const addr = make_address(c.ip);
++		first.ban_ip_temp(addr);
++		TEST_EQUAL(second.is_temp_banned(addr), !c.internal);
++		TEST_CHECK(!other.ses.is_temp_banned(addr));
++	}
++	TEST_EQUAL(aux::temp_ban_test_access::queue(fixture.ses).size(), 2);
++	TEST_EQUAL(aux::temp_ban_test_access::map(fixture.ses).size(), 2);
++	TEST_CHECK(aux::temp_ban_test_access::queue(other.ses).empty());
++	TEST_CHECK(aux::temp_ban_test_access::map(other.ses).empty());
++}
++
++TORRENT_TEST(temp_ban_mapped_key)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	address const v4 = temp_ban_address(0);
++	address const mapped = make_address("::ffff:8.8.0.0");
++
++	ses.ban_ip_temp(mapped);
++	TEST_CHECK(ses.is_temp_banned(v4));
++	TEST_CHECK(ses.is_temp_banned(mapped));
++	for (int i = 1; i < 65536; ++i)
++		ses.ban_ip_temp(temp_ban_address(i));
++
++	ses.ban_ip_temp(v4);
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(1)));
++	ses.ban_ip_temp(mapped);
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(2)));
++	ses.ban_ip_temp(temp_ban_address(65536));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(3)));
++	TEST_CHECK(ses.is_temp_banned(v4));
++	TEST_CHECK(ses.is_temp_banned(mapped));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(65536)));
++	for (int i = 0; i < 65536; ++i)
++		TEST_CHECK(ses.is_temp_banned(temp_ban_address(i)));
++	TEST_EQUAL(aux::temp_ban_test_access::queue(ses).size(), 65536);
++	TEST_EQUAL(aux::temp_ban_test_access::map(ses).size(), 65536);
++	TEST_EQUAL(aux::temp_ban_test_access::map(ses).count(mapped), 0);
++}
++
++TORRENT_TEST(temp_ban_capacity)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	fill_temp_bans(ses);
++	for (int i = 0; i < 65536; ++i)
++		TEST_CHECK(ses.is_temp_banned(temp_ban_address(i)));
++
++	auto const queue = aux::temp_ban_test_access::queue(ses);
++	auto const map = aux::temp_ban_test_access::map(ses);
++	for (int i = 65536; i < 65538; ++i)
++	{
++		ses.ban_ip_temp(temp_ban_address(i));
++		TEST_CHECK(!ses.is_temp_banned(temp_ban_address(i)));
++		TEST_CHECK(aux::temp_ban_test_access::queue(ses) == queue);
++		TEST_CHECK(aux::temp_ban_test_access::map(ses) == map);
++	}
++	for (int i = 0; i < 65536; ++i)
++		TEST_CHECK(ses.is_temp_banned(temp_ban_address(i)));
++	TEST_EQUAL(aux::temp_ban_test_access::queue(ses).size(), 65536);
++	TEST_EQUAL(aux::temp_ban_test_access::map(ses).size(), 65536);
++}
++
++TORRENT_TEST(temp_ban_lookup_fifo)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	fill_temp_bans(ses);
++	auto const queue = aux::temp_ban_test_access::queue(ses);
++	auto const map = aux::temp_ban_test_access::map(ses);
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(0)));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(2)));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(65537)));
++	ses.ban_ip_temp(temp_ban_address(65536));
++	ses.ban_ip_temp(temp_ban_address(65537));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(65536)));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(65537)));
++	for (int i = 0; i < 65536; ++i)
++		TEST_CHECK(ses.is_temp_banned(temp_ban_address(i)));
++	TEST_CHECK(aux::temp_ban_test_access::queue(ses) == queue);
++	TEST_CHECK(aux::temp_ban_test_access::map(ses) == map);
++}
++
++TORRENT_TEST(temp_ban_reban_fifo)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	fill_temp_bans(ses);
++	ses.ban_ip_temp(temp_ban_address(0));
++	ses.ban_ip_temp(temp_ban_address(0));
++	ses.ban_ip_temp(temp_ban_address(65536));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(0)));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(1)));
++	for (int i = 2; i < 65536; ++i)
++		TEST_CHECK(ses.is_temp_banned(temp_ban_address(i)));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(65536)));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 65536);
++	TEST_EQUAL(temp_ban_access::map(ses).size(), 65536);
++}
++
++TORRENT_TEST(temp_ban_expiry_exact)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0);
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0), t0));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3599)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3600)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3601)));
++}
++
++TORRENT_TEST(temp_ban_lookup_no_mutation)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0);
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(1), t0);
++	auto const queue_before = temp_ban_access::queue(ses);
++	auto const map_before = temp_ban_access::map(ses);
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0), t0));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(1), t0));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(2), t0));
++	auto const queue_after = temp_ban_access::queue(ses);
++	auto const map_after = temp_ban_access::map(ses);
++	TEST_CHECK(queue_before == queue_after);
++	TEST_CHECK(map_before == map_after);
++	TEST_EQUAL(queue_after.size(), 2);
++	TEST_EQUAL(map_after.size(), 2);
++}
++
++TORRENT_TEST(temp_ban_duplicate_no_renew)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0);
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0 + seconds(3599));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3600)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3601)));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 1);
++	TEST_EQUAL(temp_ban_access::map(ses).size(), 1);
++	TEST_CHECK(temp_ban_access::queue(ses).front().second == t0 + seconds(3600));
++}
++
++TORRENT_TEST(temp_ban_purge_multiple_expired)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0);
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(1), t0);
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(2), t0 + seconds(10));
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(3), t0 + seconds(20));
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(4), t0 + seconds(3601));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 3);
++	TEST_EQUAL(temp_ban_access::map(ses).size(), 3);
++	TEST_CHECK(temp_ban_access::queue(ses).front().first == temp_ban_address(2));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(4)
++		, t0 + seconds(3601)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3601)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(1)
++		, t0 + seconds(3601)));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(2)
++		, t0 + seconds(3601)));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(3)
++		, t0 + seconds(3601)));
++}
++
++TORRENT_TEST(temp_ban_reban_after_expiry)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0);
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0 + seconds(3600));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 1);
++	TEST_EQUAL(temp_ban_access::map(ses).size(), 1);
++	TEST_CHECK(temp_ban_access::queue(ses).front().first == temp_ban_address(0));
++	TEST_CHECK(temp_ban_access::queue(ses).front().second == t0 + seconds(7200));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3600)));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(7199)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(7200)));
++}
++
++TORRENT_TEST(temp_ban_reclaim_slot_at_expiry)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(0), t0);
++	for (int i = 1; i < 65536; ++i)
++		temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(i), t0 + seconds(1));
++	for (int i = 0; i < 65536; ++i)
++		TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(i)
++			, t0 + seconds(1)));
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(65536)
++		, t0 + seconds(3599));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(65536)
++		, t0 + seconds(3599)));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 65536);
++	TEST_EQUAL(temp_ban_access::map(ses).size(), 65536);
++	temp_ban_access::ban_ip_temp_at(ses, temp_ban_address(65536)
++		, t0 + seconds(3600));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(65536)
++		, t0 + seconds(3600)));
++	TEST_CHECK(!temp_ban_access::is_temp_banned_at(ses, temp_ban_address(0)
++		, t0 + seconds(3600)));
++	TEST_CHECK(temp_ban_access::is_temp_banned_at(ses, temp_ban_address(1)
++		, t0 + seconds(3600)));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 65536);
++	TEST_EQUAL(temp_ban_access::map(ses).size(), 65536);
++}
++
++TORRENT_TEST(temp_ban_cached_clock)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::set_temp_ban_time(ses, t0);
++	ses.ban_ip_temp(temp_ban_address(0));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(0)));
++	temp_ban_access::set_temp_ban_time(ses, t0 + seconds(3599));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(0)));
++	temp_ban_access::set_temp_ban_time(ses, t0 + seconds(3600));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(0)));
++}
++
++TORRENT_TEST(temp_ban_cached_clock_purge)
++{
++	temp_ban_session fixture;
++	auto& ses = fixture.ses;
++	monotonic_time_point const t0 = temp_ban_base_time();
++	temp_ban_access::set_temp_ban_time(ses, t0);
++	ses.ban_ip_temp(temp_ban_address(0));
++	ses.ban_ip_temp(temp_ban_address(1));
++	temp_ban_access::set_temp_ban_time(ses, t0 + seconds(3600));
++	ses.ban_ip_temp(temp_ban_address(2));
++	TEST_EQUAL(temp_ban_access::queue(ses).size(), 1);
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(0)));
++	TEST_CHECK(!ses.is_temp_banned(temp_ban_address(1)));
++	TEST_CHECK(ses.is_temp_banned(temp_ban_address(2)));
++}
++
+ TORRENT_TEST(clear_peers)
+ {
+ 	torrent_state st = init_state();
