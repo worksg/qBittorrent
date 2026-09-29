@@ -1,6 +1,6 @@
 name: CI - Windows
 
-on: [pull_request, push]
+on: [pull_request, push, workflow_dispatch]
 
 permissions: {}
 
@@ -19,10 +19,6 @@ jobs:
       fail-fast: false
       matrix:
         libtorrent:
-          - version: "2.0.11"
-            boost_major_version: "1"
-            boost_minor_version: "90"
-            boost_patch_version: "0"
           - version: "1.2.20"
             boost_major_version: "1"
             boost_minor_version: "86"
@@ -131,6 +127,12 @@ jobs:
             https://github.com/arvidn/libtorrent.git `
             ${{ env.libtorrent_path }}
           cd ${{ env.libtorrent_path }}
+
+          Get-ChildItem -Path "${{ github.workspace }}/lt-patch/*" -Include "*.patch","*.diff" -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "Applying patch: $($_.Name)"
+              git apply --ignore-whitespace $_.FullName
+          }
+
           $env:CXXFLAGS+=" /guard:cf"
           $env:LDFLAGS+=" /GUARD:CF"
           cmake `
